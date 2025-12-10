@@ -245,27 +245,24 @@ async def extract_finish_schedule(
             # Horizontal band – only take words to the RIGHT of the tag circle,
             # but not the entire page. Limit to a fixed column-width window.
             margin_right = 3.0   # small gap so we don’t pick up the tag text itself
-            column_width = page_width * 0.28  # heuristic: ~1/3 of page width per column
+            column_width = page_width * 0.25  # heuristic: ~1/3 of page width per column
             horiz_left = tag_x1 + margin_right
             horiz_right = min(tag_x1 + column_width, page_width)
 
             line_words: List[Tuple[float, float, str]] = []
             for wx0, wy0, wx1, wy1, wtext, wblock, wline, wword in words:
-                # Only use words from the same PyMuPDF block as the tag
-                if wblock != row_block_no:
-                    continue
-
                 wy_center = (wy0 + wy1) / 2.0
 
-                # Vertical filter
+                # Vertical filter – only this row band
                 if not (region_top <= wy_center <= region_bottom):
                     continue
 
-                # Horizontal filter – stay inside this column only
+                # Horizontal filter – only a narrow column to the right of the tag
                 if wx1 < horiz_left or wx0 > horiz_right:
                     continue
 
                 line_words.append((wy_center, wx0, wtext))
+
 
             # Sort by vertical, then left-to-right
             line_words.sort(key=lambda t: (t[0], t[1]))
