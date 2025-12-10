@@ -7,6 +7,9 @@ from typing import List, Dict, Any  # NEW
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File  # UploadFile, File ADDED
 from fastapi.responses import JSONResponse
 import fitz  # PyMuPDF
+from typing import List, Dict, Any, Tuple
+from collections import defaultdict
+
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
@@ -181,6 +184,14 @@ async def extract_finish_schedule(
     # ---- PASS 2: for each tag row, define a non-overlapping vertical band
     #              AND a horizontal band to the right of the tag ----
 
+    # Group rows by tag prefix (e.g. AC, WC, PT) so vertical bands are
+    # computed only within the same schedule family. This prevents an AC row
+    # from sharing a band with WC/PT rows that happen to be nearby.
+    rows_by_prefix: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        prefix = r["tag"].split("-")[0]
+        rows_by_prefix[prefix].append(r)
+
     blocks: List[Dict[str, Any]] = []
 
     if not rows:
@@ -188,93 +199,103 @@ async def extract_finish_schedule(
         return {
             "page": page_number,
             "num_blocks": 0,
-            "blocks": []
+            "blocks": [],
         }
 
-    for idx, row in enumerate(rows):
-        tag_text = row["tag"]
-        y = row["y_center"]
-        row_block_no = row["block_no"]
-        tag_x1 = row["tag_x1"]
+    for prefix, group in rows_by_prefix.items():
+        # Sort this prefix's rows by vertical position
+        group.sort(key=lambda r: r["y_center"])
 
-        prev_y = rows[idx - 1]["y_center"] if idx > 0 else None
-        next_y = rows[idx + 1]["y_center"] if idx < len(rows) - 1 else None
+        for idx, row in enumerate(group):
+            tag_text = row["tag"]
+            y = row["y_center"]
+            row_block_no = row["block_no"]
+            tag_x1 = row["tag_x1"]
 
-        # Vertical band: halfway between neighbors (same as you had)
-        if prev_y is None and next_y is not None:
-            region_top = y - (next_y - y) / 2.0
-        elif prev_y is None and next_y is None:
-            region_top = y - 20.0
-        else:
-            region_top = (prev_y + y) / 2.0
+            prev_y = group[idx - 1]["y_center"] if idx > 0 else None
+            next_y = group[idx + 1]["y_center"] if idx < len(group) - 1 else None
 
-        if next_y is None and prev_y is not None:
-            region_bottom = y + (y - prev_y) / 2.0
-        elif next_y is None and prev_y is None:
-            region_bottom = y + 20.0
-        else:
-            region_bottom = (next_y + y) / 2.0
+            # Vertical band: halfway between neighbors in the SAME prefix group
+            if prev_y is None and next_y is not None:
+                region_top = y - (next_y - y) / 2.0
+            elif prev_y is None and next_y is None:
+                region_top = y - 15.0
+            else:
+                region_top = (prev_y + y) / 2.0
 
-        # Minimum band height
-        min_height = 20.0
-        if region_bottom - region_top < min_height:
-            mid = (region_top + region_bottom) / 2.0
-            region_top = mid - min_height / 2.0
-            region_bottom = mid + min_height / 2.0
+            if next_y is None and prev_y is not None:
+                region_bottom = y + (y - prev_y) / 2.0
+            elif next_y is None and prev_y is None:
+                region_bottom = y + 15.0
+            else:
+                region_bottom = (next_y + y) / 2.0
 
-        # Extra vertical padding so we don't miss top/bottom lines like "MFR: DELETED"
-        vertical_padding = 8.0  # you can tune this between ~6–12
-        region_top -= vertical_padding
-        region_bottom += vertical_padding
+            # Minimum band height (tighter than before)
+            min_height = 18.0
+            if region_bottom - region_top < min_height:
+                mid = (region_top + region_bottom) / 2.0
+                region_top = mid - min_height / 2.0
+                region_bottom = mid + min_height / 2.0
 
-        # NEW: horizontal band – only take words to the RIGHT of the tag circle
-        margin_right = 5.0  # a small gap so we don’t pick up the tag text itself
-        horiz_left = tag_x1 + margin_right
-        horiz_right = page_width  # up to the right edge of the page
+            # Slight vertical padding so we don't clip top/bottom of the row
+            vertical_padding = 4.0
+            region_top -= vertical_padding
+            region_bottom += vertical_padding
 
-        line_words = []
-        for wx0, wy0, wx1, wy1, wtext, wblock, wline, wword in words:
-            wy_center = (wy0 + wy1) / 2.0
+            # Horizontal band – only take words to the RIGHT of the tag circle,
+            # but not the entire page. Limit to a fixed column-width window.
+            margin_right = 3.0   # small gap so we don’t pick up the tag text itself
+            column_width = page_width * 0.28  # heuristic: ~1/3 of page width per column
+            horiz_left = tag_x1 + margin_right
+            horiz_right = min(tag_x1 + column_width, page_width)
 
-            # vertical filter (same as before)
-            if not (region_top <= wy_center <= region_bottom):
-                continue
+            line_words: List[Tuple[float, float, str]] = []
+            for wx0, wy0, wx1, wy1, wtext, wblock, wline, wword in words:
+                # Only use words from the same PyMuPDF block as the tag
+                if wblock != row_block_no:
+                    continue
 
-            # horizontal filter – REJECT left-column & unrelated stuff
-            if wx1 < horiz_left or wx0 > horiz_right:
-                continue
+                wy_center = (wy0 + wy1) / 2.0
 
-            line_words.append((wy_center, wx0, wtext))
+                # Vertical filter
+                if not (region_top <= wy_center <= region_bottom):
+                    continue
 
-        # Sort by vertical, then left-to-right
-        line_words.sort(key=lambda t: (t[0], t[1]))
+                # Horizontal filter – stay inside this column only
+                if wx1 < horiz_left or wx0 > horiz_right:
+                    continue
 
-        block_text = " ".join(w[2] for w in line_words)
+                line_words.append((wy_center, wx0, wtext))
 
-        # --- NEW: try to start text at the first real schedule label ---
-        labels = ["MFR:", "LOC:", "COLOR:", "PATT:", "PATTERN:", "FINISH:", "SCALE:", "SKU:", "ITEM:"]
-        first_label_pos = None
-        upper = block_text.upper()
-        for label in labels:
-            idx = upper.find(label)
-            if idx != -1:
-                if first_label_pos is None or idx < first_label_pos:
-                    first_label_pos = idx
+            # Sort by vertical, then left-to-right
+            line_words.sort(key=lambda t: (t[0], t[1]))
 
-        if first_label_pos is not None:
-            block_text = block_text[first_label_pos:].strip()
-        # ---------------------------------------------------------------
+            block_text = " ".join(w[2] for w in line_words)
 
-        blocks.append(
-            {
-                "tag": tag_text,
-                "y_center": y,
-                "region_top": region_top,
-                "region_bottom": region_bottom,
-                "block_no": row_block_no,
-                "block_text": block_text,
-            }
-        )
+            # Try to start text at the first real schedule label
+            labels = ["MFR:", "LOC:", "COLOR:", "PATT:", "PATTERN:", "FINISH:", "SCALE:", "SKU:", "ITEM:"]
+            first_label_pos = None
+            upper = block_text.upper()
+            for label in labels:
+                idx2 = upper.find(label)
+                if idx2 != -1:
+                    if first_label_pos is None or idx2 < first_label_pos:
+                        first_label_pos = idx2
+
+            if first_label_pos is not None:
+                block_text = block_text[first_label_pos:].strip()
+
+            blocks.append(
+                {
+                    "tag": tag_text,
+                    "y_center": y,
+                    "region_top": region_top,
+                    "region_bottom": region_bottom,
+                    "block_no": row_block_no,
+                    "block_text": block_text,
+                }
+            )
+
 
 
     doc.close()
