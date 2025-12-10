@@ -182,9 +182,9 @@ async def extract_finish_schedule(
     rows.sort(key=lambda r: r["y_center"])
 
     # ---- PASS 2: for each tag row, define a non-overlapping vertical band
-    #              AND a horizontal band limited to this schedule's slice ----
+    #              and grab a wide horizontal slice to the right of the tag ----
 
-    # Group rows by tag prefix (e.g. AC, WC, PT) so bands are computed
+    # Group rows by tag prefix (e.g. AC, WC, PT) so vertical bands are computed
     # within each schedule family.
     rows_by_prefix: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for r in rows:
@@ -201,55 +201,17 @@ async def extract_finish_schedule(
             "blocks": [],
         }
 
-    # Precompute per-prefix horizontal positions
-    prefix_min_x1: Dict[str, float] = {}
-    for prefix, group in rows_by_prefix.items():
-        # Some rows may be missing tag_x1; skip those defensively
-        xs = [r["tag_x1"] for r in group if "tag_x1" in r]
-        if xs:
-            prefix_min_x1[prefix] = min(xs)
-
-    def find_right_boundary_for_prefix(this_prefix):
-        """
-        For a given prefix (e.g. AC), find the nearest tag group that starts
-        to the RIGHT (e.g. WC tags) and use that as a horizontal cutoff.
-        """
-        if this_prefix not in prefix_min_x1:
-            return None
-
-        my_min_x1 = prefix_min_x1[this_prefix]
-        candidates: List[float] = []
-
-        for other_prefix, group in rows_by_prefix.items():
-            if other_prefix == this_prefix:
-                continue
-
-            # Use tag_x1 as the horizontal reference for the other group
-            other_xs = [r["tag_x1"] for r in group if "tag_x1" in r]
-            if not other_xs:
-                continue
-            other_min_x1 = min(other_xs)
-
-            # Only consider groups clearly to the right
-            if other_min_x1 > my_min_x1 + 10.0:
-                candidates.append(other_min_x1)
-
-        if candidates:
-            return min(candidates)
-        return None
-
+    # Pattern to detect other tag codes, e.g. PT-07F, WC-10, AC-03, etc.
+    tag_pattern = re.compile(r"\b[A-Z]{1,4}-\d{1,3}[A-Z]?\b")
 
     for prefix, group in rows_by_prefix.items():
         # Sort this prefix's rows by vertical position
         group.sort(key=lambda r: r["y_center"])
 
-        right_boundary = find_right_boundary_for_prefix(prefix)
-
         for idx, row in enumerate(group):
             tag_text = row["tag"]
             y = row["y_center"]
             row_block_no = row["block_no"]
-            tag_x1 = row["tag_x1"]
 
             prev_y = group[idx - 1]["y_center"] if idx > 0 else None
             next_y = group[idx + 1]["y_center"] if idx < len(group) - 1 else None
@@ -282,16 +244,15 @@ async def extract_finish_schedule(
             region_bottom += vertical_padding
 
             # Horizontal band:
-            # - start just to the right of the tag
-            # - end at either the next schedule's tags or near the page edge
-            margin_right = 3.0
-            horiz_left = tag_x1 + margin_right
-
-            if right_boundary is not None:
-                horiz_right = max(horiz_left + 10.0, right_boundary - 3.0)
+            # - start just left of the tag
+            # - extend almost all the way to the right edge of the page
+            margin_left = 5.0
+            if "tag_x0" in row:
+                horiz_left = max(row["tag_x0"] - margin_left, 0.0)
             else:
-                # No other schedule to the right; use most of the page
-                horiz_right = page_width * 0.95
+                horiz_left = max(row["tag_x1"] - margin_left, 0.0)
+
+            horiz_right = page_width * 0.98  # wide slice across the schedule
 
             line_words: List[Tuple[float, float, str]] = []
             for wx0, wy0, wx1, wy1, wtext, wblock, wline, wword in words:
@@ -301,8 +262,13 @@ async def extract_finish_schedule(
                 if not (region_top <= wy_center <= region_bottom):
                     continue
 
-                # Horizontal filter – stay in this schedule's horizontal slice
+                # Horizontal filter – stay within the rightward slice
                 if wx1 < horiz_left or wx0 > horiz_right:
+                    continue
+
+                # Drop other tag codes (e.g. PT-07F appearing inside AC-01 band)
+                stripped = wtext.strip().upper()
+                if tag_pattern.fullmatch(stripped) and stripped != tag_text.upper():
                     continue
 
                 line_words.append((wy_center, wx0, wtext))
@@ -313,7 +279,7 @@ async def extract_finish_schedule(
             block_text = " ".join(w[2] for w in line_words)
 
             # Try to start text at the first real schedule label
-            labels = ["MFR:", "LOC:", "COLOR:", "PATT:", "PATTERN:", "FINISH:", "SCALE:", "SKU:", "ITEM:"]
+            labels = ["MFR:", "LOC:", "COLOR:", "PATT:", "PATTERN:", "FINISH:", "SCALE:", "SKU:", "ITEM:", "SIZE:"]
             first_label_pos = None
             upper = block_text.upper()
             for label in labels:
@@ -335,6 +301,7 @@ async def extract_finish_schedule(
                     "block_text": block_text,
                 }
             )
+
 
 
 
