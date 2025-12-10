@@ -204,26 +204,40 @@ async def extract_finish_schedule(
     # Precompute per-prefix horizontal positions
     prefix_min_x1: Dict[str, float] = {}
     for prefix, group in rows_by_prefix.items():
-        prefix_min_x1[prefix] = min(r["tag_x1"] for r in group)
+        # Some rows may be missing tag_x1; skip those defensively
+        xs = [r["tag_x1"] for r in group if "tag_x1" in r]
+        if xs:
+            prefix_min_x1[prefix] = min(xs)
 
-    def find_right_boundary_for_prefix(this_prefix: str) -> float | None:
+    def find_right_boundary_for_prefix(this_prefix):
         """
         For a given prefix (e.g. AC), find the nearest tag group that starts
         to the RIGHT (e.g. WC tags) and use that as a horizontal cutoff.
         """
+        if this_prefix not in prefix_min_x1:
+            return None
+
         my_min_x1 = prefix_min_x1[this_prefix]
         candidates: List[float] = []
+
         for other_prefix, group in rows_by_prefix.items():
             if other_prefix == this_prefix:
                 continue
-            # Earliest tag x0 in the other group
-            other_min_x0 = min(r["tag_x0"] for r in group)
-            # Only consider others that are clearly to the right
-            if other_min_x0 > my_min_x1 + 10.0:
-                candidates.append(other_min_x0)
+
+            # Use tag_x1 as the horizontal reference for the other group
+            other_xs = [r["tag_x1"] for r in group if "tag_x1" in r]
+            if not other_xs:
+                continue
+            other_min_x1 = min(other_xs)
+
+            # Only consider groups clearly to the right
+            if other_min_x1 > my_min_x1 + 10.0:
+                candidates.append(other_min_x1)
+
         if candidates:
             return min(candidates)
         return None
+
 
     for prefix, group in rows_by_prefix.items():
         # Sort this prefix's rows by vertical position
