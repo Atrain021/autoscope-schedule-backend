@@ -182,11 +182,10 @@ async def extract_finish_schedule(
     rows.sort(key=lambda r: r["y_center"])
 
     # ---- PASS 2: for each tag row, define a non-overlapping vertical band
-    #              AND a horizontal band to the right of the tag ----
+    #              AND a horizontal band limited to this schedule's slice ----
 
-    # Group rows by tag prefix (e.g. AC, WC, PT) so vertical bands are
-    # computed only within the same schedule family. This prevents an AC row
-    # from sharing a band with WC/PT rows that happen to be nearby.
+    # Group rows by tag prefix (e.g. AC, WC, PT) so bands are computed
+    # within each schedule family.
     rows_by_prefix: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for r in rows:
         prefix = r["tag"].split("-")[0]
@@ -202,9 +201,35 @@ async def extract_finish_schedule(
             "blocks": [],
         }
 
+    # Precompute per-prefix horizontal positions
+    prefix_min_x1: Dict[str, float] = {}
+    for prefix, group in rows_by_prefix.items():
+        prefix_min_x1[prefix] = min(r["tag_x1"] for r in group)
+
+    def find_right_boundary_for_prefix(this_prefix: str) -> float | None:
+        """
+        For a given prefix (e.g. AC), find the nearest tag group that starts
+        to the RIGHT (e.g. WC tags) and use that as a horizontal cutoff.
+        """
+        my_min_x1 = prefix_min_x1[this_prefix]
+        candidates: List[float] = []
+        for other_prefix, group in rows_by_prefix.items():
+            if other_prefix == this_prefix:
+                continue
+            # Earliest tag x0 in the other group
+            other_min_x0 = min(r["tag_x0"] for r in group)
+            # Only consider others that are clearly to the right
+            if other_min_x0 > my_min_x1 + 10.0:
+                candidates.append(other_min_x0)
+        if candidates:
+            return min(candidates)
+        return None
+
     for prefix, group in rows_by_prefix.items():
         # Sort this prefix's rows by vertical position
         group.sort(key=lambda r: r["y_center"])
+
+        right_boundary = find_right_boundary_for_prefix(prefix)
 
         for idx, row in enumerate(group):
             tag_text = row["tag"]
@@ -230,24 +255,29 @@ async def extract_finish_schedule(
             else:
                 region_bottom = (next_y + y) / 2.0
 
-            # Minimum band height (tighter than before)
+            # Minimum band height
             min_height = 18.0
             if region_bottom - region_top < min_height:
                 mid = (region_top + region_bottom) / 2.0
                 region_top = mid - min_height / 2.0
                 region_bottom = mid + min_height / 2.0
 
-            # Slight vertical padding so we don't clip top/bottom of the row
+            # Add a bit of vertical padding
             vertical_padding = 4.0
             region_top -= vertical_padding
             region_bottom += vertical_padding
 
-            # Horizontal band – only take words to the RIGHT of the tag circle,
-            # but not the entire page. Limit to a fixed column-width window.
-            margin_right = 3.0   # small gap so we don’t pick up the tag text itself
-            column_width = page_width * 0.25  # heuristic: ~1/3 of page width per column
+            # Horizontal band:
+            # - start just to the right of the tag
+            # - end at either the next schedule's tags or near the page edge
+            margin_right = 3.0
             horiz_left = tag_x1 + margin_right
-            horiz_right = min(tag_x1 + column_width, page_width)
+
+            if right_boundary is not None:
+                horiz_right = max(horiz_left + 10.0, right_boundary - 3.0)
+            else:
+                # No other schedule to the right; use most of the page
+                horiz_right = page_width * 0.95
 
             line_words: List[Tuple[float, float, str]] = []
             for wx0, wy0, wx1, wy1, wtext, wblock, wline, wword in words:
@@ -257,12 +287,11 @@ async def extract_finish_schedule(
                 if not (region_top <= wy_center <= region_bottom):
                     continue
 
-                # Horizontal filter – only a narrow column to the right of the tag
+                # Horizontal filter – stay in this schedule's horizontal slice
                 if wx1 < horiz_left or wx0 > horiz_right:
                     continue
 
                 line_words.append((wy_center, wx0, wtext))
-
 
             # Sort by vertical, then left-to-right
             line_words.sort(key=lambda t: (t[0], t[1]))
