@@ -1,18 +1,302 @@
 # main.py - minimal, known-good version for finish schedule extraction
 
 import os
+import json
+import math
+import base64
 import re
-from typing import List, Dict, Any  # NEW
-
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File  # UploadFile, File ADDED
-from fastapi.responses import JSONResponse
-import fitz  # PyMuPDF
-from typing import List, Dict, Any, Tuple
 from collections import defaultdict
 
+import fitz  # PyMuPDF
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
+from openai import OpenAI
+
+
 app = FastAPI()
+
+client = OpenAI()
+# === Vision-based finish schedule helpers ===
+
+TAG_CORE_RE = re.compile(r"^([A-Z]{1,4})(\d{1,3})([A-Z]?)$")
+
+
+def normalize_tag_core(tokens):
+    """
+    Normalize small token sequences like ["AC", "01"] or ["PT-10S"]
+    into a canonical tag like "AC-01" or "PT-10S".
+    """
+    core = "".join(tokens)
+    core = core.replace("-", "").replace(" ", "").upper()
+    m = TAG_CORE_RE.match(core)
+    if not m:
+        return None
+    prefix, num, suffix = m.groups()
+    # preserve zero padding on num (01, 02, etc.)
+    return f"{prefix}-{num}{suffix}"
+
+
+def detect_tag_rows(page):
+    """
+    Scan page words and detect tag bubbles.
+
+    Returns list of dicts:
+      { "tag", "prefix", "y_center", "tag_x0", "tag_x1" }
+    """
+    # PyMuPDF "words" format:
+    # (x0, y0, x1, y1, text, block_no, line_no, word_no)
+    words = page.get_text("words")
+    rows = []
+    used_tags = set()
+    n = len(words)
+
+    for i, w in enumerate(words):
+        x0, y0, x1, y1, text, block_no, line_no, word_no = w
+        text = text.strip()
+        if not text:
+            continue
+
+        candidates = []
+
+        # Single-token candidate, e.g. "AC01" or "PT10S"
+        tag1 = normalize_tag_core([text])
+        if tag1:
+            candidates.append((tag1, x0, x1, y0, y1))
+
+        # Two-token candidate, e.g. "AC" "01"
+        if i + 1 < n:
+            x0b, y0b, x1b, y1b, text2, *_ = words[i + 1]
+            tag2 = normalize_tag_core([text, text2])
+            if tag2:
+                candidates.append(
+                    (tag2,
+                     min(x0, x0b),
+                     max(x1, x1b),
+                     min(y0, y0b),
+                     max(y1, y1b))
+                )
+
+        if not candidates:
+            continue
+
+        tag, tx0, tx1, ty0, ty1 = candidates[0]
+        if tag in used_tags:
+            continue
+
+        used_tags.add(tag)
+        rows.append(
+            {
+                "tag": tag,
+                "prefix": tag.split("-")[0],
+                "y_center": (ty0 + ty1) / 2.0,
+                "tag_x0": tx0,
+                "tag_x1": tx1,
+            }
+        )
+
+    return rows
+
+
+def compute_row_rects(page, rows, min_band_height: float = 40.0, margin: float = 4.0):
+    """
+    Given tag rows, compute rectangular regions for each row.
+
+    - Horizontally: partition page by tag prefix (AC vs WC vs PT, etc.)
+      based on average x-position of tags.
+    - Vertically: use midpoints between neighboring rows of the same prefix.
+    """
+    if not rows:
+        return []
+
+    page_rect = page.rect
+    page_width = page_rect.width
+
+    # Group rows by prefix (AC, WC, PT, etc.)
+    by_prefix: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        by_prefix[r["prefix"]].append(r)
+
+    # Compute average x-center for each prefix
+    prefix_centers: dict[str, float] = {}
+    for prefix, group in by_prefix.items():
+        centers = [(g["tag_x0"] + g["tag_x1"]) / 2.0 for g in group]
+        prefix_centers[prefix] = sum(centers) / max(len(centers), 1)
+
+    # Order prefixes from left to right
+    sorted_prefixes = sorted(prefix_centers.items(), key=lambda kv: kv[1])
+    prefix_order = [p for p, _ in sorted_prefixes]
+
+    # For each prefix, compute a horizontal slice [left, right]
+    prefix_bounds: dict[str, tuple[float, float]] = {}
+    for idx, prefix in enumerate(prefix_order):
+        center = prefix_centers[prefix]
+
+        if idx == 0:
+            left = page_rect.x0
+        else:
+            prev_center = prefix_centers[prefix_order[idx - 1]]
+            left = (prev_center + center) / 2.0
+
+        if idx == len(prefix_order) - 1:
+            right = page_width
+        else:
+            next_center = prefix_centers[prefix_order[idx + 1]]
+            right = (center + next_center) / 2.0
+
+        prefix_bounds[prefix] = (left, right)
+
+    row_rects: list[dict] = []
+
+    # Now compute vertical bands within each prefix’s slice
+    for prefix, group in by_prefix.items():
+        group_sorted = sorted(group, key=lambda r: r["y_center"])
+        left, right = prefix_bounds[prefix]
+
+        for idx, r in enumerate(group_sorted):
+            y = r["y_center"]
+
+            # Top boundary
+            if idx == 0:
+                if len(group_sorted) > 1:
+                    next_y = group_sorted[idx + 1]["y_center"]
+                    top = y - max(min_band_height / 2.0, (next_y - y) / 2.0)
+                else:
+                    top = y - min_band_height / 2.0
+            else:
+                prev_y = group_sorted[idx - 1]["y_center"]
+                top = (prev_y + y) / 2.0
+
+            # Bottom boundary
+            if idx == len(group_sorted) - 1:
+                if len(group_sorted) > 1:
+                    prev_y = group_sorted[idx - 1]["y_center"]
+                    bottom = y + max(min_band_height / 2.0, (y - prev_y) / 2.0)
+                else:
+                    bottom = y + min_band_height / 2.0
+            else:
+                next_y = group_sorted[idx + 1]["y_center"]
+                bottom = (y + next_y) / 2.0
+
+            # Clamp to page, ensure non-zero height
+            top = max(page_rect.y0, top)
+            bottom = min(page_rect.y1, bottom)
+            if bottom <= top:
+                bottom = top + min_band_height
+
+            # Add a small margin and clamp horizontally
+            x0 = max(page_rect.x0, left + margin)
+            x1 = min(page_rect.x1, right - margin)
+
+            row_rects.append(
+                {
+                    "tag": r["tag"],
+                    "prefix": prefix,
+                    "y_center": y,
+                    "region_top": top,
+                    "region_bottom": bottom,
+                    "rect": (x0, top, x1, bottom),
+                }
+            )
+
+    return row_rects
+
+
+def vision_transcribe_rows(page, row_rects, batch_size: int = 8):
+    """
+    For each row rectangle, crop to an image and use OpenAI vision
+    to transcribe the row text.
+
+    Returns list of dicts:
+      { "tag", "y_center", "region_top", "region_bottom", "block_text" }
+    """
+    results: list[dict] = []
+
+    for i in range(0, len(row_rects), batch_size):
+        batch = row_rects[i : i + batch_size]
+
+        # Build multi-image prompt
+        content: list[dict] = []
+
+        instructions = (
+            "You are reading interior finish schedule rows from architectural drawings. "
+            "For each row IMAGE, I will tell you its TAG. Your job is to transcribe the "
+            "row text in normal reading order (left to right, top to bottom) and return "
+            "a pure JSON array. Each element in the array must be an object with:\n"
+            '{ \"tag\": \"<TAG>\", \"block_text\": \"<ONE_LINE_TEXT>\" }\n\n'
+            "Rules:\n"
+            "- Use the exact tag I provide; do NOT change it.\n"
+            "- For block_text, include all useful information you can read for that row: "
+            "manufacturer, product, color, pattern, size, location, notes, etc., in a single line. "
+            "You may insert labels like 'MFR:', 'PROD:', 'COLOR:', 'LOC:' if they appear.\n"
+            "- If the row appears blank or unreadable, use an empty string for block_text.\n"
+            "- Output ONLY JSON. No explanations, no comments."
+        )
+        content.append({"type": "input_text", "text": instructions})
+
+        # Attach each row image with its tag
+        for idx, row in enumerate(batch, start=1):
+            rect = fitz.Rect(*row["rect"])
+            pix = page.get_pixmap(clip=rect, dpi=250)
+            image_b64 = base64.b64encode(pix.tobytes("png")).decode("utf-8")
+
+            content.append(
+                {
+                    "type": "input_text",
+                    "text": f"Row {idx} TAG: {row['tag']}",
+                }
+            )
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": f"data:image/png;base64,{image_b64}",
+                }
+            )
+
+        response = client.responses.create(
+            model="gpt-4.1-mini",
+            input=[
+                {
+                    "role": "user",
+                    "content": content,
+                }
+            ],
+        )
+
+        text = response.output_text
+
+        try:
+            batch_rows = json.loads(text)
+            if not isinstance(batch_rows, list):
+                raise ValueError("Expected a JSON array")
+        except Exception:
+            # If anything goes wrong, just fallback to empty block_text
+            batch_rows = [
+                {"tag": row["tag"], "block_text": ""} for row in batch
+            ]
+
+        # Build a simple mapping tag -> block_text
+        by_tag = {
+            str(item.get("tag")): item.get("block_text", "")
+            for item in batch_rows
+            if isinstance(item, dict) and "tag" in item
+        }
+
+        for row in batch:
+            block_text = by_tag.get(row["tag"], "")
+            results.append(
+                {
+                    "tag": row["tag"],
+                    "y_center": row["y_center"],
+                    "region_top": row["region_top"],
+                    "region_bottom": row["region_bottom"],
+                    "block_text": block_text,
+                }
+            )
+
+    return results
+
 
 origins = [
     "https://ta-01kbzevp9h1svdssernwsmwj4v-5173.wo-92h8yghsztgdf4c19ktmss9an.w.modal.host",
@@ -56,262 +340,42 @@ async def ping():
 
 @app.get("/extract-finish-schedule")
 async def extract_finish_schedule(
-    filename: str = Query(..., description="PDF file name inside the 'uploads' folder"),
-    page_number: int = Query(..., ge=0, description="0-based page index"),
+    filename: str,
+    page_number: int = Query(..., ge=0),
 ):
     """
-    Read a single PDF page and extract candidate finish-schedule blocks,
-    grouped by horizontal row band around each detected tag word,
-    and LIMITED to the column to the RIGHT of the tag circle.
+    Vision-based finish schedule extraction.
+
+    1) Detect tag positions (AC-01, WC-08, PT-10S, etc.)
+    2) Compute per-tag row rectangles (geometry bands).
+    3) Use OpenAI vision to transcribe each row image into clean text.
+    4) Return blocks with tag + block_text (one line per row).
     """
+    # Adjust this if your upload directory variable has a different name
+    upload_dir = UPLOAD_DIR if "UPLOAD_DIR" in globals() else "uploads"
+    pdf_path = os.path.join(upload_dir, filename)
 
-    # 1) Resolve PDF path
-    pdf_path = os.path.join(UPLOAD_DIR, filename)
     if not os.path.exists(pdf_path):
-        raise HTTPException(status_code=404, detail=f"File not found in uploads: {filename}")
+        raise HTTPException(status_code=404, detail="File not found")
 
-    # 2) Open PDF
-    try:
-        doc = fitz.open(pdf_path)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not open PDF: {e}")
+    doc = fitz.open(pdf_path)
 
-    # 3) Validate page number
-    if page_number < 0 or page_number >= len(doc):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid page_number={page_number}. PDF has {len(doc)} pages (0-based).",
-        )
+    if page_number < 0 or page_number >= doc.page_count:
+        raise HTTPException(status_code=400, detail="Invalid page number")
 
     page = doc[page_number]
-    page_width = page.rect.width  # we’ll use this for the right edge of the column
 
-    # 4) Get raw word objects from PyMuPDF
-    # returns: (x0, y0, x1, y1, "text", block_no, line_no, word_no)
-    words = page.get_text("words")
+    # 1. Detect tag rows
+    tag_rows = detect_tag_rows(page)
 
-    # ---- PASS 1: detect tag rows (tag + approximate y_center + block_no + tag_x1) ----
+    # 2. Compute row rectangles
+    row_rects = compute_row_rects(page, tag_rows)
 
-    # Tag pattern AFTER normalization (e.g. "GL01", "DGF02", "PT10S")
-    tag_core_pattern = re.compile(r"^([A-Z]{1,4})(\d{1,3})([A-Z]?)$")
+    # 3. Vision transcription
+    blocks = vision_transcribe_rows(page, row_rects)
 
-    def normalize_candidate(tokens):
-        """
-        tokens: list of raw text fragments, e.g. ["GL", "01"] or ["PT-10S"]
-        returns: normalized tag like "GL-01" or None if not a tag
-        """
-        combined = "".join(tokens)
-        core = combined.replace("-", "").replace(" ", "").upper()
-
-        m = tag_core_pattern.match(core)
-        if not m:
-            return None
-
-        prefix, num, suffix = m.groups()
-        return f"{prefix}-{num}{suffix}"
-
-    row_candidates: List[Dict[str, Any]] = []
-    n = len(words)
-
-    for i in range(n):
-        x0_i, y0_i, x1_i, y1_i, text_i, blk_i, line_i, word_i = words[i]
-        t1 = text_i.strip()
-        if not t1:
-            continue
-
-        candidates = []
-
-        # 1-word candidate
-        tag1 = normalize_candidate([t1])
-        if tag1:
-            candidates.append((tag1, i, i))
-
-        # 2-word candidate
-        if i + 1 < n:
-            t2 = words[i + 1][4].strip()
-            if t2:
-                tag2 = normalize_candidate([t1, t2])
-                if tag2:
-                    candidates.append((tag2, i, i + 1))
-
-        # 3-word candidate (very defensive; rarely needed)
-        if i + 2 < n:
-            t2 = words[i + 1][4].strip()
-            t3 = words[i + 2][4].strip()
-            if t2 and t3:
-                tag3 = normalize_candidate([t1, t2, t3])
-                if tag3:
-                    candidates.append((tag3, i, i + 2))
-
-        for tag_text, start_idx, end_idx in candidates:
-            xs0, ys0, xs1, ys1 = [], [], [], []
-
-            # use the block_no of the first word in the tag
-            tag_block_no = words[start_idx][5]
-
-            for j in range(start_idx, end_idx + 1):
-                x0j, y0j, x1j, y1j, tj, b_j, l_j, w_j = words[j]
-                xs0.append(x0j)
-                ys0.append(y0j)
-                xs1.append(x1j)
-                ys1.append(y1j)
-
-            y_center = (min(ys0) + max(ys1)) / 2.0
-            tag_x1 = max(xs1)  # RIGHT edge of the tag circle/label
-
-            row_candidates.append(
-                {
-                    "tag": tag_text,
-                    "y_center": y_center,
-                    "block_no": tag_block_no,
-                    "tag_x1": tag_x1,
-                }
-            )
-
-    # Deduplicate rows by (tag, rounded y_center, block_no)
-    seen_keys = set()
-    rows: List[Dict[str, Any]] = []
-    for rc in row_candidates:
-        key = (rc["tag"], round(rc["y_center"], 1), rc["block_no"])
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-        rows.append(rc)
-
-    # Sort by vertical position (top to bottom)
-    rows.sort(key=lambda r: r["y_center"])
-
-    # ---- PASS 2: for each tag row, define a non-overlapping vertical band
-    #              and grab a wide horizontal slice to the right of the tag ----
-
-    # Group rows by tag prefix (e.g. AC, WC, PT) so vertical bands are computed
-    # within each schedule family.
-    rows_by_prefix: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for r in rows:
-        prefix = r["tag"].split("-")[0]
-        rows_by_prefix[prefix].append(r)
-
-    blocks: List[Dict[str, Any]] = []
-
-    if not rows:
-        doc.close()
-        return {
-            "page": page_number,
-            "num_blocks": 0,
-            "blocks": [],
-        }
-
-    # Pattern to detect other tag codes, e.g. PT-07F, WC-10, AC-03, etc.
-    tag_pattern = re.compile(r"\b[A-Z]{1,4}-\d{1,3}[A-Z]?\b")
-
-    for prefix, group in rows_by_prefix.items():
-        # Sort this prefix's rows by vertical position
-        group.sort(key=lambda r: r["y_center"])
-
-        for idx, row in enumerate(group):
-            tag_text = row["tag"]
-            y = row["y_center"]
-            row_block_no = row["block_no"]
-
-            prev_y = group[idx - 1]["y_center"] if idx > 0 else None
-            next_y = group[idx + 1]["y_center"] if idx < len(group) - 1 else None
-
-            # Vertical band: halfway between neighbors in the SAME prefix group
-            if prev_y is None and next_y is not None:
-                region_top = y - (next_y - y) / 2.0
-            elif prev_y is None and next_y is None:
-                region_top = y - 15.0
-            else:
-                region_top = (prev_y + y) / 2.0
-
-            if next_y is None and prev_y is not None:
-                region_bottom = y + (y - prev_y) / 2.0
-            elif next_y is None and prev_y is None:
-                region_bottom = y + 15.0
-            else:
-                region_bottom = (next_y + y) / 2.0
-
-            # Minimum band height
-            min_height = 18.0
-            if region_bottom - region_top < min_height:
-                mid = (region_top + region_bottom) / 2.0
-                region_top = mid - min_height / 2.0
-                region_bottom = mid + min_height / 2.0
-
-            # Add a bit of vertical padding
-            vertical_padding = 4.0
-            region_top -= vertical_padding
-            region_bottom += vertical_padding
-
-            # Horizontal band:
-            # - start just left of the tag
-            # - extend almost all the way to the right edge of the page
-            margin_left = 5.0
-            if "tag_x0" in row:
-                horiz_left = max(row["tag_x0"] - margin_left, 0.0)
-            else:
-                horiz_left = max(row["tag_x1"] - margin_left, 0.0)
-
-            horiz_right = page_width * 0.98  # wide slice across the schedule
-
-            line_words: List[Tuple[float, float, str]] = []
-            for wx0, wy0, wx1, wy1, wtext, wblock, wline, wword in words:
-                wy_center = (wy0 + wy1) / 2.0
-
-                # Vertical filter – only this row band
-                if not (region_top <= wy_center <= region_bottom):
-                    continue
-
-                # Horizontal filter – stay within the rightward slice
-                if wx1 < horiz_left or wx0 > horiz_right:
-                    continue
-
-                # Drop other tag codes (e.g. PT-07F appearing inside AC-01 band)
-                stripped = wtext.strip().upper()
-                if tag_pattern.fullmatch(stripped) and stripped != tag_text.upper():
-                    continue
-
-                line_words.append((wy_center, wx0, wtext))
-
-            # Sort by vertical, then left-to-right
-            line_words.sort(key=lambda t: (t[0], t[1]))
-
-            block_text = " ".join(w[2] for w in line_words)
-
-            # Try to start text at the first real schedule label
-            labels = ["MFR:", "LOC:", "COLOR:", "PATT:", "PATTERN:", "FINISH:", "SCALE:", "SKU:", "ITEM:", "SIZE:"]
-            first_label_pos = None
-            upper = block_text.upper()
-            for label in labels:
-                idx2 = upper.find(label)
-                if idx2 != -1:
-                    if first_label_pos is None or idx2 < first_label_pos:
-                        first_label_pos = idx2
-
-            if first_label_pos is not None:
-                block_text = block_text[first_label_pos:].strip()
-
-            blocks.append(
-                {
-                    "tag": tag_text,
-                    "y_center": y,
-                    "region_top": region_top,
-                    "region_bottom": region_bottom,
-                    "block_no": row_block_no,
-                    "block_text": block_text,
-                }
-            )
-
-
-
-
-    doc.close()
-
-    return JSONResponse(
-        {
-            "page": page_number,
-            "num_blocks": len(blocks),
-            "blocks": blocks,
-        }
-    )
-
+    return {
+        "page": page_number,
+        "num_blocks": len(blocks),
+        "blocks": blocks,
+    }
