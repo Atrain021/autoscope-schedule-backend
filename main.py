@@ -99,13 +99,26 @@ def detect_tag_rows(page):
     return rows
 
 
-def compute_row_rects(page, rows, min_band_height: float = 40.0, margin: float = 4.0):
+def compute_row_rects(page, rows, min_band_height: float = 80.0, margin: float = 4.0):
     """
-    Given tag rows, compute rectangular regions for each row.
+    VERY SIMPLE VERSION:
 
-    - Horizontally: partition page by tag prefix (AC vs WC vs PT, etc.)
-      based on average x-position of tags.
-    - Vertically: use midpoints between neighboring rows of the same prefix.
+    For each detected tag row, create a fixed-height horizontal band
+    centered on its y_center that spans almost the full page width.
+
+    We do NOT try to be clever about neighbors or prefixes here.
+    The goal is: one narrow horizontal strip per tag, so vision cannot
+    accidentally see half the page.
+
+    Returns list of dicts:
+      {
+        "tag": str,
+        "prefix": str,
+        "y_center": float,
+        "region_top": float,
+        "region_bottom": float,
+        "rect": (x0, top, x1, bottom)
+      }
     """
     if not rows:
         return []
@@ -113,79 +126,43 @@ def compute_row_rects(page, rows, min_band_height: float = 40.0, margin: float =
     page_rect = page.rect
     page_width = page_rect.width
 
-    # Group rows by prefix (AC, WC, PT, etc.)
-    by_prefix: dict[str, list[dict]] = defaultdict(list)
-    for r in rows:
-        by_prefix[r["prefix"]].append(r)
-
-    # Compute average x-center for each prefix
-    prefix_centers: dict[str, float] = {}
-    for prefix, group in by_prefix.items():
-        centers = [(g["tag_x0"] + g["tag_x1"]) / 2.0 for g in group]
-        prefix_centers[prefix] = sum(centers) / max(len(centers), 1)
-
-    # Order prefixes from left to right
-    sorted_prefixes = sorted(prefix_centers.items(), key=lambda kv: kv[1])
-    prefix_order = [p for p, _ in sorted_prefixes]
-
-    # For each prefix, compute a horizontal slice [left, right]
-    prefix_bounds: dict[str, tuple[float, float]] = {}
-    for idx, prefix in enumerate(prefix_order):
-        center = prefix_centers[prefix]
-
-        if idx == 0:
-            left = page_rect.x0
-        else:
-            prev_center = prefix_centers[prefix_order[idx - 1]]
-            left = (prev_center + center) / 2.0
-
-        if idx == len(prefix_order) - 1:
-            right = page_width
-        else:
-            next_center = prefix_centers[prefix_order[idx + 1]]
-            right = (center + next_center) / 2.0
-
-        prefix_bounds[prefix] = (left, right)
+    # Fixed vertical band height
+    band_height = float(min_band_height)
 
     row_rects: list[dict] = []
 
-    # Now compute vertical bands within each prefix’s slice
-    # Use a fixed-height band around each tag center so we never grab half the page.
-    band_height = min_band_height  # interpret min_band_height as our fixed band height
+    for r in rows:
+        tag = r["tag"]
+        prefix = r["prefix"]
+        y = float(r["y_center"])
 
-    for prefix, group in by_prefix.items():
-        group_sorted = sorted(group, key=lambda r: r["y_center"])
-        left, right = prefix_bounds[prefix]
+        # Centered fixed-height band
+        top = y - band_height / 2.0
+        bottom = y + band_height / 2.0
 
-        for r in group_sorted:
-            y = r["y_center"]
+        # Clamp to page bounds
+        top = max(page_rect.y0, top)
+        bottom = min(page_rect.y1, bottom)
+        if bottom <= top:
+            bottom = top + band_height / 2.0
 
-            # Centered fixed-height band
-            top = y - band_height / 2.0
-            bottom = y + band_height / 2.0
+        # Take almost full page width (with small horizontal margins)
+        x0 = max(page_rect.x0, page_rect.x0 + margin)
+        x1 = min(page_rect.x1, page_rect.x1 - margin)
 
-            # Clamp to page
-            top = max(page_rect.y0, top)
-            bottom = min(page_rect.y1, bottom)
-            if bottom <= top:
-                bottom = top + band_height / 2.0
-
-            # Add a small horizontal margin and clamp
-            x0 = max(page_rect.x0, left + margin)
-            x1 = min(page_rect.x1, right - margin)
-
-            row_rects.append(
-                {
-                    "tag": r["tag"],
-                    "prefix": prefix,
-                    "y_center": y,
-                    "region_top": top,
-                    "region_bottom": bottom,
-                    "rect": (x0, top, x1, bottom),
-                }
-            )
+        row_rects.append(
+            {
+                "tag": tag,
+                "prefix": prefix,
+                "y_center": y,
+                "region_top": top,
+                "region_bottom": bottom,
+                "rect": (x0, top, x1, bottom),
+            }
+        )
 
     return row_rects
+
 
 
 
