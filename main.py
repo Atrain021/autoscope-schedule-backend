@@ -150,42 +150,27 @@ def compute_row_rects(page, rows, min_band_height: float = 40.0, margin: float =
     row_rects: list[dict] = []
 
     # Now compute vertical bands within each prefix’s slice
+    # Use a fixed-height band around each tag center so we never grab half the page.
+    band_height = min_band_height  # interpret min_band_height as our fixed band height
+
     for prefix, group in by_prefix.items():
         group_sorted = sorted(group, key=lambda r: r["y_center"])
         left, right = prefix_bounds[prefix]
 
-        for idx, r in enumerate(group_sorted):
+        for r in group_sorted:
             y = r["y_center"]
 
-            # Top boundary
-            if idx == 0:
-                if len(group_sorted) > 1:
-                    next_y = group_sorted[idx + 1]["y_center"]
-                    top = y - max(min_band_height / 2.0, (next_y - y) / 2.0)
-                else:
-                    top = y - min_band_height / 2.0
-            else:
-                prev_y = group_sorted[idx - 1]["y_center"]
-                top = (prev_y + y) / 2.0
+            # Centered fixed-height band
+            top = y - band_height / 2.0
+            bottom = y + band_height / 2.0
 
-            # Bottom boundary
-            if idx == len(group_sorted) - 1:
-                if len(group_sorted) > 1:
-                    prev_y = group_sorted[idx - 1]["y_center"]
-                    bottom = y + max(min_band_height / 2.0, (y - prev_y) / 2.0)
-                else:
-                    bottom = y + min_band_height / 2.0
-            else:
-                next_y = group_sorted[idx + 1]["y_center"]
-                bottom = (y + next_y) / 2.0
-
-            # Clamp to page, ensure non-zero height
+            # Clamp to page
             top = max(page_rect.y0, top)
             bottom = min(page_rect.y1, bottom)
             if bottom <= top:
-                bottom = top + min_band_height
+                bottom = top + band_height / 2.0
 
-            # Add a small margin and clamp horizontally
+            # Add a small horizontal margin and clamp
             x0 = max(page_rect.x0, left + margin)
             x1 = min(page_rect.x1, right - margin)
 
@@ -201,6 +186,7 @@ def compute_row_rects(page, rows, min_band_height: float = 40.0, margin: float =
             )
 
     return row_rects
+
 
 
 def vision_transcribe_rows(page, row_rects, batch_size: int = 8):
