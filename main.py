@@ -344,12 +344,16 @@ async def extract_finish_schedule(
     page_number: int = Query(..., ge=0),
 ):
     """
-    Vision-based finish schedule extraction.
+    Vision-based finish schedule extraction (full-page).
 
-    1) Detect tag positions (AC-01, WC-08, PT-10S, etc.)
-    2) Compute per-tag row rectangles (geometry bands).
-    3) Use OpenAI vision to transcribe each row image into clean text.
-    4) Return blocks with tag + block_text (one line per row).
+    Flow:
+    1) Open the uploaded PDF and the target page.
+    2) Detect all finish tags (AC-01, PT-10S, CT-10, DGF-01, etc.) using text.
+    3) Render the entire page to a PNG image.
+    4) Ask OpenAI vision: given THIS page image and THIS exact list of tags,
+       return a JSON object with one entry per tag:
+         { "tag": "<TAG>", "block_text": "<ROW TEXT>" }
+    5) Return blocks in the legacy format used by Base44.
     """
     # Adjust this if your upload directory variable has a different name
     upload_dir = UPLOAD_DIR if "UPLOAD_DIR" in globals() else "uploads"
@@ -365,14 +369,111 @@ async def extract_finish_schedule(
 
     page = doc[page_number]
 
-    # 1. Detect tag rows
+    # 1) Detect tags on this page
     tag_rows = detect_tag_rows(page)
+    if not tag_rows:
+        # No tags detected; just return empty
+        return {
+            "page": page_number,
+            "num_blocks": 0,
+            "blocks": [],
+        }
 
-    # 2. Compute row rectangles
-    row_rects = compute_row_rects(page, tag_rows)
+    # Sort tags in reading order (top to bottom, left to right)
+    tag_rows_sorted = sorted(
+        tag_rows,
+        key=lambda r: (r["y_center"], r["tag_x0"]),
+    )
+    tag_list = [row["tag"] for row in tag_rows_sorted]
 
-    # 3. Vision transcription
-    blocks = vision_transcribe_rows(page, row_rects)
+    # 2) Render the entire page as an image
+    pix = page.get_pixmap(dpi=250)
+    img_b64 = base64.b64encode(pix.tobytes("png")).decode("utf-8")
+    img_data_url = f"data:image/png;base64,{img_b64}"
+
+    # 3) Build the instruction for vision
+    tags_str = ", ".join(tag_list)
+
+    instructions = (
+        "You are reading an interior finish schedule page from an architectural drawing set.\n\n"
+        "The page contains multiple schedules (acoustical ceilings, wall coverings, paint, tile, etc.) "
+        "laid out in columns and rows. Each row is identified by a TAG such as AC-01, WC-10, PT-07F, "
+        "CT-10, DGF-01, etc.\n\n"
+        f"The set of tags that appear on THIS page and that we care about is:\n{tags_str}\n\n"
+        "Your job:\n"
+        "  - For each tag in this list, find the row in the schedule(s) that corresponds to that tag.\n"
+        "  - Read ALL the text in that row that is associated with that tag (across all relevant columns), "
+        "    in normal reading order (left to right, top to bottom).\n"
+        "  - For each tag, produce an object:\n"
+        '      { \"tag\": \"<TAG>\", \"block_text\": \"<ONE_LINE_TEXT>\" }\n\n'
+        "Rules:\n"
+        "  - Use ONLY the tags from the list I provided. Do NOT invent or add any tags that are not listed.\n"
+        "  - For each tag, block_text should be a single line containing all useful row information: "
+        "    manufacturer, product, color, pattern, size, location, notes, etc.\n"
+        "    You may include labels like 'MFR:', 'PROD:', 'COLOR:', 'SIZE:', 'LOC:' if they appear.\n"
+        "  - If a tag appears to be deleted or has no meaningful information, you may set block_text to "
+        "    an empty string or a short note like 'DELETED'.\n"
+        "  - If you absolutely cannot find a tag on the page, include it with block_text = \"\".\n"
+        "  - Output MUST be a single JSON object of the form:\n"
+        "      { \"items\": [ { \"tag\": \"...\", \"block_text\": \"...\" }, ... ] }\n"
+        "    where there is exactly one item for each tag in the list.\n"
+        "  - Do NOT include any extra commentary, explanations, or text outside of that JSON.\n"
+    )
+
+    # 4) Call OpenAI vision
+    try:
+        response = client.responses.create(
+            model="gpt-4.1-mini",
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": instructions},
+                        {"type": "input_image", "image_url": img_data_url},
+                    ],
+                }
+            ],
+        )
+        raw_text = response.output_text
+        data = json.loads(raw_text)
+    except Exception as e:
+        # If anything goes wrong, fall back to empty block_texts
+        data = {"items": []}
+
+    # Build a mapping from tag -> block_text from the model output
+    by_tag: dict[str, str] = {}
+    if isinstance(data, dict) and "items" in data and isinstance(data["items"], list):
+        for item in data["items"]:
+            if not isinstance(item, dict):
+                continue
+            t = str(item.get("tag", "")).strip()
+            bt = str(item.get("block_text", "")).strip()
+            if t:
+                by_tag[t] = bt
+
+    # 5) Build the legacy blocks array expected by the frontend
+    blocks = []
+    for row in tag_rows_sorted:
+        tag = row["tag"]
+        y = float(row["y_center"])
+        # region_top / region_bottom are not trusted for geometry anymore;
+        # we just give a small band around the y-center for debugging.
+        band_height = 40.0
+        top = y - band_height / 2.0
+        bottom = y + band_height / 2.0
+
+        block_text = by_tag.get(tag, "")
+
+        blocks.append(
+            {
+                "tag": tag,
+                "y_center": y,
+                "region_top": top,
+                "region_bottom": bottom,
+                "block_no": 0,  # no real meaning here; kept for compatibility
+                "block_text": block_text,
+            }
+        )
 
     return {
         "page": page_number,
