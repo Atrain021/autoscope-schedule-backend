@@ -43,7 +43,15 @@ def detect_tag_rows(page):
     Scan page words and detect tag bubbles.
 
     Returns list of dicts:
-      { "tag", "prefix", "y_center", "tag_x0", "tag_x1" }
+      {
+        "tag": str,
+        "prefix": str,
+        "y_center": float,
+        "tag_x0": float,
+        "tag_x1": float,
+        "tag_y0": float,
+        "tag_y1": float
+      }
     """
     # PyMuPDF "words" format:
     # (x0, y0, x1, y1, text, block_no, line_no, word_no)
@@ -71,21 +79,25 @@ def detect_tag_rows(page):
             tag2 = normalize_tag_core([text, text2])
             if tag2:
                 candidates.append(
-                    (tag2,
-                     min(x0, x0b),
-                     max(x1, x1b),
-                     min(y0, y0b),
-                     max(y1, y1b))
+                    (
+                        tag2,
+                        min(x0, x0b),
+                        max(x1, x1b),
+                        min(y0, y0b),
+                        max(y1, y1b),
+                    )
                 )
 
         if not candidates:
             continue
 
+        # Take the first candidate
         tag, tx0, tx1, ty0, ty1 = candidates[0]
         if tag in used_tags:
             continue
 
         used_tags.add(tag)
+
         rows.append(
             {
                 "tag": tag,
@@ -93,47 +105,43 @@ def detect_tag_rows(page):
                 "y_center": (ty0 + ty1) / 2.0,
                 "tag_x0": tx0,
                 "tag_x1": tx1,
+                "tag_y0": ty0,
+                "tag_y1": ty1,
             }
         )
 
     return rows
 
 
-def compute_row_rects(page, rows, min_band_height: float = 80.0, margin: float = 4.0):
+
+def compute_row_rects(page, rows, vertical_pad: float = 30.0, margin: float = 4.0):
     """
-    Row rectangle computation:
+    For each detected tag:
 
-    - Group tag rows by prefix (AC, WC, PT, CT, DGF, etc.).
-    - For each prefix, compute a horizontal slice [left, right] based on
-      the average x-position of that prefix's tags. This isolates columns.
-    - For each row, create a fixed-height horizontal band centered on the
-      tag's y_center, limited to that prefix's slice.
+    - Use the tag's own bounding box (tag_y0, tag_y1) as the vertical anchor.
+    - Expand that box up and down by a small padding (vertical_pad).
+    - Restrict horizontally to that prefix's column slice (AC vs WC vs CT vs PT, etc.).
 
-    This guarantees:
-    - Vertical bands are bounded (no massive height).
-    - Horizontal bands do not cross into other schedule columns.
+    This removes all "smart" banding and ties each row rectangle tightly to the
+    actual tag bubble on the page.
     """
     if not rows:
         return []
 
     page_rect = page.rect
-    page_width = page_rect.width
 
-    # Fixed vertical band height (row strip height)
-    band_height = float(min_band_height)
-
-    # 1) Group rows by prefix (AC, WC, PT, CT, etc.)
+    # 1) Group rows by prefix
     by_prefix: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
         by_prefix[r["prefix"]].append(r)
 
-    # 2) Compute average x-center for each prefix to understand column layout
+    # 2) Compute average x-center for each prefix
     prefix_centers: dict[str, float] = {}
     for prefix, group in by_prefix.items():
         centers = [ (g["tag_x0"] + g["tag_x1"]) / 2.0 for g in group ]
         prefix_centers[prefix] = sum(centers) / max(len(centers), 1)
 
-    # 3) Sort prefixes left-to-right and assign horizontal bounds between centers
+    # 3) Sort prefixes left-to-right and define horizontal bounds between centers
     sorted_prefixes = sorted(prefix_centers.items(), key=lambda kv: kv[1])
     prefix_bounds: dict[str, tuple[float, float]] = {}
 
@@ -152,7 +160,7 @@ def compute_row_rects(page, rows, min_band_height: float = 80.0, margin: float =
 
         prefix_bounds[prefix] = (left, right)
 
-    # 4) Build row rectangles: fixed-height vertical band within prefix slice
+    # 4) Build one tight rectangle per row using the tag box + padding
     row_rects: list[dict] = []
 
     for prefix, group in by_prefix.items():
@@ -160,19 +168,22 @@ def compute_row_rects(page, rows, min_band_height: float = 80.0, margin: float =
 
         for r in group:
             tag = r["tag"]
-            y = float(r["y_center"])
+            y0 = float(r["tag_y0"])
+            y1 = float(r["tag_y1"])
+            y_center = float(r["y_center"])
 
-            # Centered fixed-height band
-            top = y - band_height / 2.0
-            bottom = y + band_height / 2.0
+            # Vertical band = tag box ± vertical_pad
+            top = y0 - vertical_pad
+            bottom = y1 + vertical_pad
 
             # Clamp to page
             top = max(page_rect.y0, top)
             bottom = min(page_rect.y1, bottom)
             if bottom <= top:
-                bottom = top + band_height / 2.0
+                # minimal safety height if something weird happens
+                bottom = top + max(10.0, (y1 - y0) + 2 * vertical_pad)
 
-            # Horizontal slice for this prefix (column), with a small margin
+            # Horizontal slice for this prefix, with a small margin
             x0 = max(page_rect.x0, left + margin)
             x1 = min(page_rect.x1, right - margin)
 
@@ -180,7 +191,7 @@ def compute_row_rects(page, rows, min_band_height: float = 80.0, margin: float =
                 {
                     "tag": tag,
                     "prefix": prefix,
-                    "y_center": y,
+                    "y_center": y_center,
                     "region_top": top,
                     "region_bottom": bottom,
                     "rect": (x0, top, x1, bottom),
@@ -188,7 +199,6 @@ def compute_row_rects(page, rows, min_band_height: float = 80.0, margin: float =
             )
 
     return row_rects
-
 
 
 
