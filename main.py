@@ -1,23 +1,28 @@
-# main.py - minimal, known-good version for finish schedule extraction
+
+# main.py - AutoScope finish schedule backend
 
 import os
-import json
-import math
-import base64
 import re
+import json
+import base64
 from collections import defaultdict
 
-import fitz  # PyMuPDF
-
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+
+import fitz  # PyMuPDF
 
 from openai import OpenAI
 
 
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 app = FastAPI()
 
-client = OpenAI()
+
+
+
 # === Vision-based finish schedule helpers ===
 
 TAG_CORE_RE = re.compile(r"^([A-Z]{1,4})(\d{1,3})([A-Z]?)$")
