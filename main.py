@@ -391,10 +391,26 @@ async def extract_finish_schedule(
     )
     tag_list = [row["tag"] for row in tag_rows_sorted]
 
-    # 2) Render the entire page as an image
-    pix = page.get_pixmap(dpi=250)
+    # 2) Render the entire page as an image, but cap pixel size to avoid OOM
+    page_rect = page.rect
+
+    # We want the longer side to be at most ~3000 pixels
+    max_pixels = 3000.0
+    longer_side_points = max(page_rect.width, page_rect.height)
+
+    # Base resolution is 72 dpi → 1 point = 1 pixel at zoom=1
+    # Compute zoom so longer side ≈ max_pixels (but cap at 2x for safety)
+    zoom = max_pixels / longer_side_points
+    zoom = min(zoom, 2.0)
+    if zoom <= 0:
+        zoom = 1.0
+
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+
     img_b64 = base64.b64encode(pix.tobytes("png")).decode("utf-8")
     img_data_url = f"data:image/png;base64,{img_b64}"
+
 
     # 3) Build the instruction for vision
     tags_str = ", ".join(tag_list)
