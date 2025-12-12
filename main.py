@@ -259,7 +259,7 @@ def vision_extract_for_tile(image_url: str, tag_list: List[str]) -> Dict[str, st
 
     tags_str = ", ".join(tag_list)
 
-prompt = (
+    prompt = (
     "You are reading a PNG IMAGE CROP from a construction drawing finish schedule.\n"
     "This schedule lists multiple finish TAGS (e.g., AC-01, WC-10, PT-06F, CT-10) and their associated description text.\n"
     "Tags may appear as 'AC 01', 'AC-01', 'AC01', or similar. They may be inside a circle/box or plain text.\n"
@@ -280,7 +280,7 @@ prompt = (
     f"REQUESTED TAGS (extract ONLY these): {tags_str}\n\n"
     "OUTPUT JSON ONLY (no extra text):\n"
     "{ \"items\": [ { \"tag\": \"AC-01\", \"block_text\": \"...\" }, ... ] }\n"
-)
+    )
 
 
 
