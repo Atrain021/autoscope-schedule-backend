@@ -336,6 +336,137 @@ async def upload_pdf(file: UploadFile = File(...)):
         f.write(contents)
 
     return {"filename": file.filename}
+SECTION_HEADER_RE = re.compile(r"^\s*\d{2}\s+\d{2}\s+\d{2}\s+")
+SECTION_KEYWORDS = [
+    "ACOUSTICAL", "CEILINGS", "WALL COVERINGS", "WALLCOVERINGS",
+    "PAINT", "PAINTING", "TILE", "FLOORING", "CARPET", "BASE",
+    "COUNTERTOP", "QUARTZ", "STONE", "GLASS", "DOOR", "MILLWORK"
+]
+
+def _group_words_into_lines(words, y_tol=2.0):
+    """
+    words: list of (x0, y0, x1, y1, text, block_no, line_no, word_no)
+    Returns list of dict lines with: y, x0, x1, text, y0, y1
+    """
+    items = []
+    for w in words:
+        x0, y0, x1, y1, t, *_ = w
+        t = (t or "").strip()
+        if not t:
+            continue
+        y = (y0 + y1) / 2.0
+        items.append((y, x0, x1, y0, y1, t))
+
+    items.sort(key=lambda r: (r[0], r[1]))
+
+    lines = []
+    cur = []
+    cur_y = None
+
+    def flush():
+        if not cur:
+            return
+        cur_sorted = sorted(cur, key=lambda r: r[1])  # by x0
+        text = " ".join([r[5] for r in cur_sorted]).strip()
+        y0 = min(r[3] for r in cur_sorted)
+        y1 = max(r[4] for r in cur_sorted)
+        x0 = min(r[1] for r in cur_sorted)
+        x1 = max(r[2] for r in cur_sorted)
+        y = sum(r[0] for r in cur_sorted) / len(cur_sorted)
+        lines.append({"y": y, "y0": y0, "y1": y1, "x0": x0, "x1": x1, "text": text})
+
+    for y, x0, x1, y0, y1, t in items:
+        if cur_y is None:
+            cur_y = y
+            cur = [(y, x0, x1, y0, y1, t)]
+            continue
+        if abs(y - cur_y) <= y_tol:
+            cur.append((y, x0, x1, y0, y1, t))
+        else:
+            flush()
+            cur_y = y
+            cur = [(y, x0, x1, y0, y1, t)]
+
+    flush()
+    return lines
+
+def detect_section_headers(page) -> List[Dict[str, Any]]:
+    """
+    Detect schedule section headers using the text layer.
+    Returns list of {y0, y1, y, text}
+    """
+    words = page.get_text("words")
+    lines = _group_words_into_lines(words, y_tol=2.5)
+
+    headers = []
+    for ln in lines:
+        txt = (ln["text"] or "").strip()
+        txt_u = txt.upper()
+
+        is_header = False
+        if SECTION_HEADER_RE.search(txt):
+            is_header = True
+        else:
+            # keyword fallback
+            for kw in SECTION_KEYWORDS:
+                if kw in txt_u:
+                    # only treat as header if it looks “big / title-ish”
+                    # (usually all caps and not too long)
+                    if len(txt_u) <= 80:
+                        is_header = True
+                    break
+
+        if is_header:
+            headers.append({"y0": ln["y0"], "y1": ln["y1"], "y": ln["y"], "text": txt})
+
+    headers.sort(key=lambda h: h["y0"])
+    return headers
+
+def build_section_bands(page, headers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Build vertical section rectangles from header -> next header.
+    Returns list of {top, bottom, header_text}
+    """
+    rect = page.rect
+    bands = []
+
+    if not headers:
+        # one band = whole page
+        bands.append({"top": rect.y0, "bottom": rect.y1, "header_text": "FULL_PAGE"})
+        return bands
+
+    for i, h in enumerate(headers):
+        top = max(rect.y0, h["y0"] - 6)  # small padding above header
+        if i + 1 < len(headers):
+            bottom = min(rect.y1, headers[i + 1]["y0"] - 6)
+        else:
+            bottom = rect.y1
+
+        if bottom - top < 40:
+            continue
+
+        bands.append({"top": top, "bottom": bottom, "header_text": h["text"]})
+
+    return bands
+
+def render_page_clip_base64(page, clip_rect: fitz.Rect, max_long_side_px=2200.0) -> str:
+    """
+    Render a clipped region of the page to PNG base64 data-url,
+    with a pixel cap to avoid memory errors on Render.
+    """
+    w_pts = clip_rect.width
+    h_pts = clip_rect.height
+    longer_pts = max(w_pts, h_pts)
+
+    zoom = max_long_side_px / max(longer_pts, 1.0)
+    zoom = min(zoom, 3.0)  # safety
+    zoom = max(zoom, 0.6)  # avoid too tiny
+
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, clip=clip_rect, alpha=False)
+
+    b64 = base64.b64encode(pix.tobytes("png")).decode("utf-8")
+    return f"data:image/png;base64,{b64}"
 
 
 @app.get("/ping")
@@ -348,176 +479,115 @@ async def extract_finish_schedule(
     filename: str,
     page_number: int = Query(..., ge=0),
 ):
-    """
-    Vision-based finish schedule extraction (full-page).
-
-    Flow:
-    1) Open the uploaded PDF and the target page.
-    2) Detect all finish tags (AC-01, PT-10S, CT-10, DGF-01, etc.) using text.
-    3) Render the entire page to a PNG image.
-    4) Ask OpenAI vision: given THIS page image and THIS exact list of tags,
-       return a JSON object with one entry per tag:
-         { "tag": "<TAG>", "block_text": "<ROW TEXT>" }
-    5) Return blocks in the legacy format used by Base44.
-    """
-    # Adjust this if your upload directory variable has a different name
-    upload_dir = UPLOAD_DIR if "UPLOAD_DIR" in globals() else "uploads"
-    pdf_path = os.path.join(upload_dir, filename)
-
+    pdf_path = os.path.join(UPLOAD_DIR, filename)
     if not os.path.exists(pdf_path):
         raise HTTPException(status_code=404, detail="File not found")
 
     doc = fitz.open(pdf_path)
-
     if page_number < 0 or page_number >= doc.page_count:
         raise HTTPException(status_code=400, detail="Invalid page number")
 
     page = doc[page_number]
 
-    # 1) Detect tags on this page
+    # 1) Detect tag rows (you already have this function; keep using it)
     tag_rows = detect_tag_rows(page)
     if not tag_rows:
-        # No tags detected; just return empty
-        return {
-            "page": page_number,
-            "num_blocks": 0,
-            "blocks": [],
-        }
+        return {"page": page_number, "num_blocks": 0, "blocks": []}
 
-    # Sort tags in reading order (top to bottom, left to right)
-    tag_rows_sorted = sorted(
-        tag_rows,
-        key=lambda r: (r["y_center"], r["tag_x0"]),
-    )
-    tag_list = [row["tag"] for row in tag_rows_sorted]
+    tag_rows_sorted = sorted(tag_rows, key=lambda r: (r["y_center"], r.get("tag_x0", 0)))
+    all_tags = [r["tag"] for r in tag_rows_sorted]
 
-    # 2) Render the entire page as an image, but cap pixel size to avoid OOM
-    page_rect = page.rect
+    # 2) Detect section headers and build section bands
+    headers = detect_section_headers(page)
+    bands = build_section_bands(page, headers)
 
-    # We want the longer side to be at most ~3000 pixels
-    max_pixels = 3000.0
-    longer_side_points = max(page_rect.width, page_rect.height)
+    # 3) Vision extract per band (few calls per page)
+    by_tag: Dict[str, str] = {}
 
-    # Base resolution is 72 dpi → 1 point = 1 pixel at zoom=1
-    # Compute zoom so longer side ≈ max_pixels (but cap at 2x for safety)
-    zoom = max_pixels / longer_side_points
-    zoom = min(zoom, 2.0)
-    if zoom <= 0:
-        zoom = 1.0
+    for band in bands:
+        top = band["top"]
+        bottom = band["bottom"]
+        header_text = band["header_text"]
 
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
+        # Tags whose y_center falls inside this band
+        band_tags = [r["tag"] for r in tag_rows_sorted if top <= r["y_center"] <= bottom]
+        if not band_tags:
+            continue
 
-    img_b64 = base64.b64encode(pix.tobytes("png")).decode("utf-8")
-    img_data_url = f"data:image/png;base64,{img_b64}"
+        clip_rect = fitz.Rect(page.rect.x0, top, page.rect.x1, bottom)
+        img_url = render_page_clip_base64(page, clip_rect, max_long_side_px=2200.0)
 
+        tags_str = ", ".join(band_tags)
 
-    # 3) Build the instruction for vision
-    tags_str = ", ".join(tag_list)
-
-    instructions = (
-        "You are reading an interior finish schedule page from an architectural drawing set.\n\n"
-        "The page contains one or more GRIDDed schedules laid out in rows and columns. Each row\n"
-        "is identified on the far left by a small circular or boxed TAG label such as AC-01,\n"
-        "AC-02, WC-10, PT-07F, CT-10, DGF-01, etc.\n\n"
-        "IMPORTANT: For each tag, you MUST do the following EXACTLY:\n"
-        "  1. Visually locate the tag label itself (e.g. the circle that says 'AC 01').\n"
-        "  2. Identify the horizontal grid ROW that this tag label sits in. That row is bounded\n"
-        "     by the horizontal lines immediately above and below it in the table.\n"
-        "  3. Follow that row horizontally across the table, staying strictly between those\n"
-        "     two horizontal grid lines. Only text inside that band belongs to that tag.\n"
-        "  4. Within that band, read the text in normal reading order (left to right, then\n"
-        "     the next column, etc.). This typically includes columns such as manufacturer,\n"
-        "     product, pattern, color, size, and location (LOC: ...).\n"
-        "  5. Completely IGNORE any text that is above or below that tag's row, even if it\n"
-        "     mentions similar products (e.g. Armstrong flooring) or looks related.\n"
-        "     If the text is not in the same horizontal band as the tag label, it is NOT part\n"
-        "     of that tag's row.\n\n"
-        "The set of tags that appear on THIS page and that we care about is:\n"
-        f"{tags_str}\n\n"
-        "Your job:\n"
-        "  - For EACH tag in this list, find the corresponding row as described above.\n"
-        "  - Read ALL useful text inside that row band (between its horizontal lines), across\n"
-        "    ALL relevant columns of that row.\n"
-        "  - For each tag, produce an object:\n"
-        '      { \"tag\": \"<TAG>\", \"block_text\": \"<ROW_TEXT>\" }\n\n'
-        "ROW_TEXT should:\n"
-        "  - Be a single line of text that concatenates the row contents in a readable way.\n"
-        "  - Include, when present, things like manufacturer, product, pattern, color, size,\n"
-        "    and location (LOC: ...), e.g.: \"MFR: ARKTURA PROD: VAPOR PATT: CUMULA COLOR: WHITE\n"
-        "    SIZE: 16'7\" X 51'6\" LOC: LOBBY - CEILING DROP HEIGHT TO BOTTOM: 11'-0\" AFF\".\n"
-        "  - You may preserve labels like 'MFR:', 'PROD:', 'COLOR:', 'PATT:', 'SIZE:', 'LOC:'.\n"
-        "  - MUST NOT include text from other unrelated rows or other schedules on the page.\n\n"
-        "Deleted / empty rows:\n"
-        "  - If a tag clearly indicates the finish is deleted or has no meaningful info,\n"
-        "    you may set block_text to an empty string or a short note like 'DELETED'.\n"
-        "  - If you absolutely cannot find a tag on the page, include it with block_text = \"\".\n\n"
-        "Output format:\n"
-        "  - Return a single JSON object of the exact form:\n"
-        "      { \"items\": [ { \"tag\": \"...\", \"block_text\": \"...\" }, ... ] }\n"
-        "  - There must be exactly ONE item for each tag in the list I provided.\n"
-        "  - Do NOT add any tags I did not list.\n"
-        "  - Do NOT include any explanations, comments, or extra text outside that JSON.\n"
-    )
-
-
-    # 4) Call OpenAI vision
-    try:
-        response = client.responses.create(
-            model="gpt-4.1-mini",
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": instructions},
-                        {"type": "input_image", "image_url": img_data_url},
-                    ],
-                }
-            ],
+        prompt = (
+            "You are reading a cropped region of an interior finish schedule from construction drawings.\n\n"
+            f"SECTION TITLE (context only): {header_text}\n\n"
+            "This crop contains a grid/table of schedule rows. Each row is identified on the far left by a\n"
+            "small circular/boxed tag label (example: AC-01 shown as 'AC 01').\n\n"
+            "TASK:\n"
+            "For each tag in the list below, locate that tag label in the crop and read ONLY the text that\n"
+            "belongs to that same ROW (bounded by the horizontal grid lines immediately above and below).\n"
+            "Then return one JSON item per tag.\n\n"
+            "TAGS TO EXTRACT (ONLY THESE):\n"
+            f"{tags_str}\n\n"
+            "RULES:\n"
+            " - Do NOT mix rows. Text must be in the same row band as the tag.\n"
+            " - Output must be strict JSON only.\n"
+            " - IMPORTANT: Only return block_text = \"DELETED\" if you can literally see the word DELETED\n"
+            "   in the same row as that tag. Otherwise, if you are unsure, use an empty string.\n"
+            " - If a tag is not visible in this crop, include it with block_text=\"\".\n\n"
+            "OUTPUT FORMAT (JSON only):\n"
+            "{ \"items\": [ { \"tag\": \"AC-01\", \"block_text\": \"...\" }, ... ] }\n"
         )
-        raw_text = response.output_text
-        data = json.loads(raw_text)
-    except Exception as e:
-        # If anything goes wrong, fall back to empty block_texts
-        data = {"items": []}
 
-    # Build a mapping from tag -> block_text from the model output
-    by_tag: dict[str, str] = {}
-    if isinstance(data, dict) and "items" in data and isinstance(data["items"], list):
-        for item in data["items"]:
-            if not isinstance(item, dict):
-                continue
-            t = str(item.get("tag", "")).strip()
-            bt = str(item.get("block_text", "")).strip()
-            if t:
-                by_tag[t] = bt
+        try:
+            resp = client.responses.create(
+                model="gpt-4.1",  # accuracy > cost here; we are doing few calls
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": prompt},
+                            {"type": "input_image", "image_url": img_url},
+                        ],
+                    }
+                ],
+            )
+            raw = resp.output_text
+            data = json.loads(raw)
+        except Exception:
+            data = {"items": []}
 
-    # 5) Build the legacy blocks array expected by the frontend
+        items = data.get("items", []) if isinstance(data, dict) else []
+        if isinstance(items, list):
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                t = str(it.get("tag", "")).strip()
+                bt = str(it.get("block_text", "")).strip()
+                if not t:
+                    continue
+
+                # Safety: prevent false DELETED unless the model explicitly returned it
+                if bt.upper() == "DELETED":
+                    by_tag.setdefault(t, "DELETED")
+                else:
+                    by_tag.setdefault(t, bt)
+
+    # 4) Build response blocks (keep same shape your frontend expects)
     blocks = []
     for row in tag_rows_sorted:
         tag = row["tag"]
         y = float(row["y_center"])
-        # region_top / region_bottom are not trusted for geometry anymore;
-        # we just give a small band around the y-center for debugging.
-        band_height = 40.0
-        top = y - band_height / 2.0
-        bottom = y + band_height / 2.0
-
-        block_text = by_tag.get(tag, "")
-
         blocks.append(
             {
                 "tag": tag,
                 "y_center": y,
-                "region_top": top,
-                "region_bottom": bottom,
-                "block_no": 0,  # no real meaning here; kept for compatibility
-                "block_text": block_text,
+                "region_top": y - 20,
+                "region_bottom": y + 20,
+                "block_no": 0,
+                "block_text": by_tag.get(tag, ""),
             }
         )
 
-    return {
-        "page": page_number,
-        "num_blocks": len(blocks),
-        "blocks": blocks,
-    }
+    return {"page": page_number, "num_blocks": len(blocks), "blocks": blocks}
