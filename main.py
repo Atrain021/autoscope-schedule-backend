@@ -10,6 +10,8 @@ from collections import defaultdict
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from typing import List, Dict, Any
+
 
 import fitz  # PyMuPDF
 
