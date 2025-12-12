@@ -259,24 +259,33 @@ def vision_extract_for_tile(image_url: str, tag_list: List[str]) -> Dict[str, st
 
     tags_str = ", ".join(tag_list)
 
-    prompt = (
-        "You are reading an IMAGE tile (PNG crop) of an interior finish schedule on a LANDSCAPE drawing sheet.\n"
-        "This tile contains a grid/table. Each schedule row has a tag label on the left like 'AC 01' meaning AC-01.\n\n"
-        "TASK:\n"
-        "For each tag in the list below, locate that tag label in this IMAGE tile and read ONLY the text in the SAME ROW.\n"
-        "Stay between the horizontal grid lines for that row. Do NOT mix text from other rows.\n\n"
-        f"TAGS (extract ONLY these): {tags_str}\n\n"
-        "RULES:\n"
-        " - If you cannot see a tag or its row in this tile, return block_text=\"\" for that tag.\n"
-        " - Only output block_text=\"DELETED\" if the literal word DELETED appears in the SAME ROW as the tag.\n"
-        " - Otherwise, never guess DELETED.\n"
-        " - Return strict JSON only.\n\n"
-        "OUTPUT JSON (no extra text):\n"
-        "{ \"items\": [ { \"tag\": \"AC-01\", \"block_text\": \"...\" }, ... ] }\n"
-    )
+prompt = (
+    "You are reading a PNG IMAGE CROP from a construction drawing finish schedule.\n"
+    "This schedule lists multiple finish TAGS (e.g., AC-01, WC-10, PT-06F, CT-10) and their associated description text.\n"
+    "Tags may appear as 'AC 01', 'AC-01', 'AC01', or similar. They may be inside a circle/box or plain text.\n"
+    "The schedule may be arranged in one or more columns and may or may not have visible grid lines.\n\n"
+    "TASK:\n"
+    "For EACH requested tag below, find that tag in the image. Then extract the description text that belongs to THAT tag.\n"
+    "The description text means: the nearby text that is clearly associated with that tag's entry (same row/line block/entry).\n"
+    "Include ALL relevant text shown for that tag (any fields such as manufacturer, product, color, pattern, size, location, finish, notes, scale, etc.).\n"
+    "Do NOT summarize or paraphrase — transcribe what you see as plain text.\n\n"
+    "ASSOCIATION RULE (prevents mixing):\n"
+    "Only use text that belongs to that tag's entry. Do NOT include text that belongs to a different tag.\n"
+    "If the schedule has rows, stay within that row. If it is column blocks, stay within that tag’s block.\n\n"
+    "DELETED RULE:\n"
+    "Only return block_text=\"DELETED\" if the word DELETED appears clearly associated with that same tag’s entry.\n"
+    "If not sure, do NOT guess DELETED.\n\n"
+    "MISSING RULE:\n"
+    "If you cannot confidently find the tag in this image crop, return block_text=\"\" for that tag.\n\n"
+    f"REQUESTED TAGS (extract ONLY these): {tags_str}\n\n"
+    "OUTPUT JSON ONLY (no extra text):\n"
+    "{ \"items\": [ { \"tag\": \"AC-01\", \"block_text\": \"...\" }, ... ] }\n"
+)
+
+
 
     resp = client.responses.create(
-        model="gpt-4.1",
+        model="gpt-4o",
         input=[
             {
                 "role": "user",
@@ -332,7 +341,7 @@ async def extract_finish_schedule(
         return {"page": page_number, "num_blocks": 0, "blocks": []}
 
     # 2) build tiles (landscape defaults)
-    tiles = make_tiles_for_landscape(page.rect, cols=3, rows=6, col_overlap=0.12, row_overlap=0.15)
+    tiles = make_tiles_for_landscape(page.rect, cols=3, rows=10, col_overlap=0.12, row_overlap=0.15)
 
     # Only keep tiles that contain at least one tag anchor (reduces OpenAI calls)
     tiles = [t for t in tiles if tile_contains_any_tags(t, tag_rows)]
@@ -349,7 +358,7 @@ async def extract_finish_schedule(
         if not tile_tags:
             continue
 
-        img_url = render_clip_as_data_url(page, tile, max_long_side_px=1500.0)
+        img_url = render_clip_as_data_url(page, tile, max_long_side_px=2200.0)
 
         try:
             extracted = vision_extract_for_tile(img_url, tile_tags)
