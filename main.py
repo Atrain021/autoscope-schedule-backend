@@ -914,6 +914,11 @@ def extract_finish_schedule_vision(
         page_png, scale = render_page_png(doc, page_number, max_width_px=2200)
         page_b64 = b64_png(page_png)
 
+        rows = []  # always define to avoid UnboundLocalError
+        row_tag_cells = []
+        row_desc_cells = []
+        row_bboxes = []
+
         # 2) Detect grid lines (this is the core of "perfect")
         page_img = png_bytes_to_cv2(page_png)
         hlines = detect_horizontal_lines(page_img)
@@ -969,7 +974,6 @@ def extract_finish_schedule_vision(
             print(f"[grid_cols] tag_col={tag_col_j} tag_x0={tag_x0} tag_x1={tag_x1} desc_x0={desc_x0}")
 
             # Build row crops: (tag cell crop, description region crop) per row
-            row_imgs_b64 = []
             row_bboxes = []  # store [x0,y0,x1,y1] of full row
             row_tag_cells = []
             row_desc_cells = []
@@ -1012,33 +1016,67 @@ def extract_finish_schedule_vision(
             mode = "grid"
             print(f"[grid_rows] rows={len(row_bboxes)}")
 
+        # 3) Transcribe rows
+        tag_to_text: Dict[str, str] = {}
+        tag_to_bbox: Dict[str, List[int]] = {}
+
+        if mode == "grid":
+            # Use paired (tag cell + desc cell) reading
+            BATCH = 4  # keep small to avoid memory spikes
+            n = len(row_bboxes)
+
+            for i0 in range(0, n, BATCH):
+                batch_tag_imgs = row_tag_cells[i0:i0 + BATCH]
+                batch_desc_imgs = row_desc_cells[i0:i0 + BATCH]
+
+                items = vision_transcribe_grid_rows(batch_tag_imgs, batch_desc_imgs)
+
+                for it in items:
+                    idx = it.get("i", -1)
+                    tag = (it.get("tag") or "").strip().upper()
+                    txt = (it.get("block_text") or "").strip()
+
+                    if not isinstance(idx, int):
+                        continue
+                    real_idx = i0 + idx
+                    if real_idx < 0 or real_idx >= n:
+                        continue
+                    if not tag:
+                        continue
+
+                    if tag not in tag_to_text or len(txt) > len(tag_to_text[tag]):
+                        tag_to_text[tag] = txt
+                        tag_to_bbox[tag] = row_bboxes[real_idx]
+
+        else:
+            # fallback: single row image reading
+            # IMPORTANT: in fallback, row_imgs_b64 must exist (you build it in fallback branch)
+            BATCH = 6
+            n = len(row_imgs_b64)
+
+            for i0 in range(0, n, BATCH):
+                batch_imgs = row_imgs_b64[i0:i0 + BATCH]
+                items = vision_transcribe_rows(batch_imgs)
+
+                for it in items:
+                    idx = it.get("i", -1)
+                    tag = (it.get("tag") or "").strip().upper()
+                    txt = (it.get("block_text") or "").strip()
+
+                    if not isinstance(idx, int):
+                        continue
+                    real_idx = i0 + idx
+                    if real_idx < 0 or real_idx >= len(row_bboxes):
+                        continue
+                    if not tag:
+                        continue
+
+                    if tag not in tag_to_text or len(txt) > len(tag_to_text[tag]):
+                        tag_to_text[tag] = txt
+                        tag_to_bbox[tag] = row_bboxes[real_idx]
 
 
-        # 3) Crop each row bbox to its own image (using PDF clip rect)
-        row_imgs_b64: List[str] = []
-        row_bboxes: List[List[int]] = []
-
-        for r in rows:
-            bbox_px = r.get("row_bbox_px")
-            if not bbox_px or len(bbox_px) != 4:
-                continue
-
-            row_png = crop_png_bytes(page_png, bbox_px)
-            if not row_png:
-                continue
-
-            # OPTIONAL: downscale big crops to save memory + improve speed
-            img = png_bytes_to_cv2(row_png)
-            h, w = img.shape[:2]
-            max_w = 1200
-            if w > max_w:
-                scale_ds = max_w / float(w)
-                img = cv2.resize(img, (int(w*scale_ds), int(h*scale_ds)), interpolation=cv2.INTER_AREA)
-                ok, out = cv2.imencode(".png", img)
-                row_png = out.tobytes() if ok else row_png
-
-            row_imgs_b64.append(b64_png(row_png))
-            row_bboxes.append(bbox_px)
+  
 
 
         # 4) Batch transcribe
