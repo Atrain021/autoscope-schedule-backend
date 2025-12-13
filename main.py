@@ -1,11 +1,12 @@
 
 # main.py - Finish Schedule backend (image-tiling + vision extraction)
+import io
 
 import os
 import re
 import json
 import base64
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 
 import fitz  # PyMuPDF
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File
@@ -33,6 +34,132 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+def render_page_png(doc: fitz.Document, page_number: int, max_width_px: int = 2200) -> Tuple[bytes, float]:
+    """
+    Renders a page to a PNG image. Returns (png_bytes, scale_factor_px_per_pdf_unit).
+    scale_factor lets us convert pixel bboxes back to PDF coordinates.
+    """
+    page = doc.load_page(page_number)
+    rect = page.rect
+
+    # Scale so the rendered image is ~max_width_px wide
+    scale = max_width_px / rect.width
+    mat = fitz.Matrix(scale, scale)
+
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    png_bytes = pix.tobytes("png")
+    return png_bytes, scale
+
+
+def b64_png(png_bytes: bytes) -> str:
+    return base64.b64encode(png_bytes).decode("utf-8")
+
+
+def px_bbox_to_pdf_rect(px_bbox: List[float], scale: float) -> fitz.Rect:
+    """
+    Convert pixel bbox [x0,y0,x1,y1] (in rendered image space) to PDF rect coords.
+    """
+    x0, y0, x1, y1 = px_bbox
+    return fitz.Rect(x0 / scale, y0 / scale, x1 / scale, y1 / scale)
+def vision_detect_rows(page_png_b64: str) -> List[Dict[str, Any]]:
+    """
+    Returns a list of rows: [{ "tag": "AC-01", "row_bbox_px": [x0,y0,x1,y1] }, ...]
+    row_bbox_px MUST bound only that row (between horizontal grid lines).
+    """
+    prompt = (
+        "You are looking at an IMAGE of a construction drawing finish schedule page.\n"
+        "This page contains one or more schedule sections with grid lines.\n"
+        "Each schedule ROW begins with a circular (or similar) row marker/bubble containing a tag label.\n\n"
+        "TASK:\n"
+        "1) Find every schedule row marker/bubble on the page.\n"
+        "2) Read the tag label inside it (normalize to format PREFIX-NUMBER with optional suffix, e.g., AC-01, PT-06F).\n"
+        "3) For each row marker, return a bounding box (pixel coords) that captures ONLY that row's content\n"
+        "   between its horizontal grid lines, extending across the row to include description and location text.\n\n"
+        "RULES:\n"
+        "- Only include items that are clearly row markers (bubbles) starting a schedule row.\n"
+        "- Ignore page titles, sheet numbers (like I-601), notes, or random text that is not a row marker.\n"
+        "- If you are unsure a marker is a row marker, do not include it.\n"
+        "- Return strict JSON only.\n\n"
+        "OUTPUT JSON:\n"
+        "{ \"rows\": [ { \"tag\": \"AC-01\", \"row_bbox_px\": [x0,y0,x1,y1] }, ... ] }\n"
+    )
+
+    resp = client.responses.create(
+        model="gpt-4o",
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": f"data:image/png;base64,{page_png_b64}"}
+                ],
+            }
+        ],
+    )
+
+    raw = resp.output_text.strip()
+
+    # Safe JSON parse (handles fences)
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z]*\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw).strip()
+    if not (raw.startswith("{") and raw.endswith("}")):
+        m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if not m:
+            raise ValueError(f"Row detect: no JSON found. Head: {raw[:200]}")
+        raw = m.group(0)
+
+    data = json.loads(raw)
+    return data.get("rows", [])
+def vision_transcribe_rows(row_images_b64: List[str], row_tags: List[str]) -> Dict[str, str]:
+    """
+    Given row images (each is a single row crop), return {tag: block_text}.
+    Batched: we send multiple images in one call.
+    """
+    assert len(row_images_b64) == len(row_tags)
+
+    # Build a single prompt that references each image/tag in order
+    header = (
+        "You will be given several IMAGE crops. Each image is exactly ONE row from a finish schedule.\n"
+        "For each image, read and transcribe the descriptive text for that row.\n\n"
+        "RULES:\n"
+        "- Do NOT mix content from different images.\n"
+        "- If the row contains the word 'DELETED' for that row, return block_text='DELETED'.\n"
+        "- Otherwise, return the row's descriptive text as written (manufacturer/product/color/size/location/etc if present).\n"
+        "- Do not invent missing fields.\n"
+        "- Return strict JSON only.\n\n"
+        "OUTPUT:\n"
+        "{ \"items\": [ { \"tag\": \"AC-01\", \"block_text\": \"...\" }, ... ] }\n"
+    )
+
+    content = [{"type": "input_text", "text": header}]
+
+    for i, (b64img, tag) in enumerate(zip(row_images_b64, row_tags), start=1):
+        content.append({"type": "input_text", "text": f"IMAGE {i} TAG: {tag}"})
+        content.append({"type": "input_image", "image_url": f"data:image/png;base64,{b64img}"})
+
+    resp = client.responses.create(
+        model="gpt-4o",
+        input=[{"role": "user", "content": content}],
+    )
+
+    raw = resp.output_text.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z]*\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw).strip()
+    if not (raw.startswith("{") and raw.endswith("}")):
+        m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if not m:
+            raise ValueError(f"Row transcribe: no JSON found. Head: {raw[:200]}")
+        raw = m.group(0)
+
+    data = json.loads(raw)
+    out: Dict[str, str] = {}
+    for it in data.get("items", []):
+        t = it.get("tag", "")
+        out[t] = it.get("block_text", "") or ""
+    return out
 
 
 @app.get("/ping")
@@ -507,3 +634,80 @@ async def extract_finish_schedule(
         )
 
     return {"page": page_number, "num_blocks": len(blocks), "blocks": blocks}
+@app.get("/extract-finish-schedule-vision")
+def extract_finish_schedule_vision(
+    filename: str = Query(...),
+    page_number: int = Query(..., ge=0),
+):
+    pdf_path = os.path.join(UPLOAD_DIR, filename)
+    if not os.path.exists(pdf_path):
+        raise HTTPException(status_code=404, detail=f"File not found: {filename}")
+
+    try:
+        doc = fitz.open(pdf_path)
+        if page_number >= len(doc):
+            raise HTTPException(status_code=400, detail="page_number out of range")
+
+        # 1) Render page image
+        page_png, scale = render_page_png(doc, page_number, max_width_px=2200)
+        page_b64 = b64_png(page_png)
+
+        # 2) Vision detects schedule rows (bubble + row bbox)
+        rows = vision_detect_rows(page_b64)
+        print(f"[vision_detect_rows] rows={len(rows)}")
+
+        # 3) Crop each row bbox to its own image (using PDF clip rect)
+        page = doc.load_page(page_number)
+
+        row_tags: List[str] = []
+        row_imgs_b64: List[str] = []
+
+        for r in rows:
+            tag = (r.get("tag") or "").strip()
+            bbox_px = r.get("row_bbox_px")
+            if not tag or not bbox_px or len(bbox_px) != 4:
+                continue
+
+            clip = px_bbox_to_pdf_rect(bbox_px, scale)
+
+            # Render just this row area (small image)
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip, alpha=False)
+            row_png = pix.tobytes("png")
+
+            row_tags.append(tag)
+            row_imgs_b64.append(b64_png(row_png))
+
+        # 4) Batch transcribe rows (10 rows per call)
+        tag_to_text: Dict[str, str] = {}
+
+        BATCH = 10
+        for i in range(0, len(row_tags), BATCH):
+            batch_tags = row_tags[i:i+BATCH]
+            batch_imgs = row_imgs_b64[i:i+BATCH]
+            batch_map = vision_transcribe_rows(batch_imgs, batch_tags)
+            tag_to_text.update(batch_map)
+
+        # 5) Build response in the format Base44 expects
+        blocks = []
+        for r in rows:
+            tag = (r.get("tag") or "").strip()
+            bbox_px = r.get("row_bbox_px") or [0, 0, 0, 0]
+            y_center = (bbox_px[1] + bbox_px[3]) / 2.0
+            blocks.append({
+                "tag": tag,
+                "y_center": y_center,
+                "region_top": bbox_px[1],
+                "region_bottom": bbox_px[3],
+                "block_no": 0,
+                "block_text": tag_to_text.get(tag, "")
+            })
+
+        return JSONResponse({
+            "page": page_number,
+            "num_blocks": len(blocks),
+            "blocks": blocks
+        })
+
+    except Exception as e:
+        print("❌ extract_finish_schedule_vision error:", repr(e))
+        raise HTTPException(status_code=500, detail=str(e))
