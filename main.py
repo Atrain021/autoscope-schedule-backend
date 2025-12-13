@@ -1,5 +1,10 @@
 
 # main.py - Finish Schedule backend (image-tiling + vision extraction)
+
+import numpy as np
+import cv2
+import math
+
 import io
 
 import os
@@ -113,54 +118,193 @@ def vision_detect_rows(page_png_b64: str) -> List[Dict[str, Any]]:
 
     data = json.loads(raw)
     return data.get("rows", [])
-def vision_transcribe_rows(row_images_b64: List[str], row_tags: List[str]) -> Dict[str, str]:
+def vision_transcribe_rows(batch_imgs_b64: List[str]) -> List[Dict[str, str]]:
     """
-    Given row images (each is a single row crop), return {tag: block_text}.
-    Batched: we send multiple images in one call.
+    For each row image, return {tag, block_text}.
+    Output list index must match input image index.
     """
-    assert len(row_images_b64) == len(row_tags)
-
-    # Build a single prompt that references each image/tag in order
-    header = (
-        "You will be given several IMAGE crops. Each image is exactly ONE row from a finish schedule.\n"
-        "For each image, read and transcribe the descriptive text for that row.\n\n"
-        "RULES:\n"
-        "- Do NOT mix content from different images.\n"
-        "- If the row contains the word 'DELETED' for that row, return block_text='DELETED'.\n"
-        "- Otherwise, return the row's descriptive text as written (manufacturer/product/color/size/location/etc if present).\n"
-        "- Do not invent missing fields.\n"
-        "- Return strict JSON only.\n\n"
-        "OUTPUT:\n"
-        "{ \"items\": [ { \"tag\": \"AC-01\", \"block_text\": \"...\" }, ... ] }\n"
+    prompt = (
+        "You are reading one or more IMAGE crops from a construction finish schedule.\n"
+        "IMPORTANT: Each image shows exactly ONE schedule ROW.\n\n"
+        "For EACH image i (starting at i=0 in the order provided):\n"
+        "1) Read the row's TAG from the left-side marker/bubble.\n"
+        "   Normalize to PREFIX-NUMBER with optional suffix (examples: AC-01, PT-06F, CT-10).\n"
+        "2) Extract ONLY the description text that belongs to that SAME ROW.\n"
+        "   Do NOT include text from any other row.\n"
+        "3) Only output block_text=\"DELETED\" if the literal word DELETED appears in that row.\n"
+        "   Otherwise never guess DELETED.\n"
+        "4) If you cannot confidently read a tag, return tag=\"\" for that image.\n"
+        "5) You MUST return exactly one JSON item for every image index i.\n\n"
+        "Return STRICT JSON ONLY in this exact shape:\n"
+        "{ \"items\": [ {\"i\": 0, \"tag\": \"AC-01\", \"block_text\": \"...\"}, {\"i\": 1, \"tag\": \"\", \"block_text\": \"\"}, ... ] }\n"
     )
 
-    content = [{"type": "input_text", "text": header}]
 
-    for i, (b64img, tag) in enumerate(zip(row_images_b64, row_tags), start=1):
-        content.append({"type": "input_text", "text": f"IMAGE {i} TAG: {tag}"})
-        content.append({"type": "input_image", "image_url": f"data:image/png;base64,{b64img}"})
+    content = [{"type": "input_text", "text": prompt}]
+    for img_b64 in batch_imgs_b64:
+        content.append({"type": "input_image", "image_url": f"data:image/png;base64,{img_b64}"})
 
     resp = client.responses.create(
         model="gpt-4o",
         input=[{"role": "user", "content": content}],
     )
 
-    raw = resp.output_text.strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```[a-zA-Z]*\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw).strip()
-    if not (raw.startswith("{") and raw.endswith("}")):
-        m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
-        if not m:
-            raise ValueError(f"Row transcribe: no JSON found. Head: {raw[:200]}")
-        raw = m.group(0)
+    data = safe_json_loads(resp.output_text)
+    items = data.get("items", []) if isinstance(data, dict) else []
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
 
-    data = json.loads(raw)
-    out: Dict[str, str] = {}
-    for it in data.get("items", []):
-        t = it.get("tag", "")
-        out[t] = it.get("block_text", "") or ""
+        try:
+            idx = int(it.get("i", -1))
+        except Exception:
+            idx = -1
+
+        out.append({
+            "i": idx,
+            "tag": str(it.get("tag", "")).strip().upper(),
+            "block_text": str(it.get("block_text", "")).strip()
+        })
     return out
+
+
+
+def png_bytes_to_cv2(png_bytes: bytes) -> np.ndarray:
+    arr = np.frombuffer(png_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Failed to decode PNG to image")
+    return img
+
+def crop_png_bytes(png_bytes: bytes, bbox: List[int]) -> bytes:
+    """
+    Crop a rendered page PNG using pixel bbox [x0,y0,x1,y1] and return PNG bytes.
+    """
+    img = png_bytes_to_cv2(png_bytes)
+    h, w = img.shape[:2]
+    x0, y0, x1, y1 = bbox
+    x0 = max(0, min(w-1, int(x0)))
+    x1 = max(0, min(w,   int(x1)))
+    y0 = max(0, min(h-1, int(y0)))
+    y1 = max(0, min(h,   int(y1)))
+    if x1 <= x0 or y1 <= y0:
+        return b""
+    crop = img[y0:y1, x0:x1]
+    ok, out = cv2.imencode(".png", crop)
+    return out.tobytes() if ok else b""
+
+
+def detect_horizontal_lines(img: np.ndarray) -> List[int]:
+    """
+    Returns y-positions of horizontal grid lines in pixel coords.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Invert to make lines bright
+    inv = 255 - gray
+
+    # Threshold
+    _, bw = cv2.threshold(inv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Morphology to extract horizontal lines
+    h, w = bw.shape
+    kernel_len = max(20, w // 30)
+    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 1))
+
+    horiz = cv2.erode(bw, horiz_kernel, iterations=1)
+    horiz = cv2.dilate(horiz, horiz_kernel, iterations=2)
+
+    # Find contours -> y positions
+    contours, _ = cv2.findContours(horiz, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    ys = []
+    for c in contours:
+        x, y, ww, hh = cv2.boundingRect(c)
+        if ww > w * 0.15:  # ignore tiny line fragments
+            ys.append(y)
+
+    ys = sorted(ys)
+    # Deduplicate near-duplicates
+    dedup = []
+    for y in ys:
+        if not dedup or abs(y - dedup[-1]) > 4:
+            dedup.append(y)
+    return dedup
+
+def detect_bubbles(img: np.ndarray) -> List[Dict[str, Any]]:
+    """
+    Detect circular bubbles. Returns list of {x,y,r} in pixel coords.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.medianBlur(gray, 5)
+
+    # HoughCircles is sensitive; we’ll tune parameters safely.
+    circles = cv2.HoughCircles(
+        gray,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=30,        # min distance between bubble centers
+        param1=120,        # edge detection threshold
+        param2=30,         # circle center detection threshold
+        minRadius=10,
+        maxRadius=40
+    )
+
+    out = []
+    if circles is not None:
+        circles = np.round(circles[0, :]).astype("int")
+        for (x, y, r) in circles:
+            out.append({"x": int(x), "y": int(y), "r": int(r)})
+    return out
+def build_row_boxes(img: np.ndarray, bubbles: List[Dict[str, Any]], hlines: List[int]) -> List[List[int]]:
+    """
+    For each bubble, find nearest horizontal lines above/below to form a row box:
+    [x0,y0,x1,y1] in pixels.
+    """
+    h, w = img.shape[:2]
+    row_boxes = []
+
+    if len(hlines) < 4 or len(bubbles) < 5:
+        return row_boxes
+
+    # Sort bubbles top-to-bottom
+    bubbles_sorted = sorted(bubbles, key=lambda b: b["y"])
+
+    # Estimate left boundary based on bubble centers (bubble column)
+    bubble_xs = [b["x"] for b in bubbles_sorted]
+    left_col_x = int(np.percentile(bubble_xs, 15))  # left-ish bubble column
+
+    # Row right boundary: we don’t know exact table border yet; use 95% width for now
+    right_x = int(w * 0.95)
+
+    for b in bubbles_sorted:
+        y = b["y"]
+
+        # find nearest line above and below
+        above = [ly for ly in hlines if ly < y]
+        below = [ly for ly in hlines if ly > y]
+        if not above or not below:
+            continue
+
+        y0 = above[-1]
+        y1 = below[0]
+
+        # sanity: ignore huge spans (this is what caused your “massive” blocks)
+        if (y1 - y0) > 180:  # tuned; we can adjust based on your sheet DPI
+            continue
+        if (y1 - y0) < 18:
+            continue
+
+        x0 = max(0, left_col_x - 5)
+        row_boxes.append([x0, y0, right_x, y1])
+
+    # Deduplicate very similar boxes
+    row_boxes = sorted(row_boxes, key=lambda bb: (bb[1], bb[0]))
+    dedup = []
+    for bb in row_boxes:
+        if not dedup or abs(bb[1] - dedup[-1][1]) > 6:
+            dedup.append(bb)
+    return dedup
 
 
 @app.get("/ping")
@@ -653,55 +797,103 @@ def extract_finish_schedule_vision(
         page_png, scale = render_page_png(doc, page_number, max_width_px=2200)
         page_b64 = b64_png(page_png)
 
-        # 2) Vision detects schedule rows (bubble + row bbox)
-        rows = vision_detect_rows(page_b64)
-        print(f"[vision_detect_rows] rows={len(rows)}")
+        # 2) OpenCV detects row geometry (universal)
+        page_img = png_bytes_to_cv2(page_png)
+        hlines = detect_horizontal_lines(page_img)
+        bubbles = detect_bubbles(page_img)
+        row_boxes = build_row_boxes(page_img, bubbles, hlines)
+
+        print(f"[cv_rows] hlines={len(hlines)} bubbles={len(bubbles)} row_boxes={len(row_boxes)}")
+
+        # Convert row_boxes -> rows structure expected by downstream logic
+        rows = []
+        for bb in row_boxes:
+            x0, y0, x1, y1 = bb
+            rows.append({
+                "tag": "",  # we will read tag from the row crop using GPT
+                "row_bbox_px": [x0, y0, x1, y1]
+            })
+
 
         # 3) Crop each row bbox to its own image (using PDF clip rect)
-        page = doc.load_page(page_number)
-
-        row_tags: List[str] = []
         row_imgs_b64: List[str] = []
+        row_bboxes: List[List[int]] = []
 
         for r in rows:
-            tag = (r.get("tag") or "").strip()
             bbox_px = r.get("row_bbox_px")
-            if not tag or not bbox_px or len(bbox_px) != 4:
+            if not bbox_px or len(bbox_px) != 4:
                 continue
 
-            clip = px_bbox_to_pdf_rect(bbox_px, scale)
+            row_png = crop_png_bytes(page_png, bbox_px)
+            if not row_png:
+                continue
 
-            # Render just this row area (small image)
-            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip, alpha=False)
-            row_png = pix.tobytes("png")
+            # OPTIONAL: downscale big crops to save memory + improve speed
+            img = png_bytes_to_cv2(row_png)
+            h, w = img.shape[:2]
+            max_w = 1200
+            if w > max_w:
+                scale_ds = max_w / float(w)
+                img = cv2.resize(img, (int(w*scale_ds), int(h*scale_ds)), interpolation=cv2.INTER_AREA)
+                ok, out = cv2.imencode(".png", img)
+                row_png = out.tobytes() if ok else row_png
 
-            row_tags.append(tag)
             row_imgs_b64.append(b64_png(row_png))
+            row_bboxes.append(bbox_px)
 
-        # 4) Batch transcribe rows (10 rows per call)
+
+        # 4) Batch transcribe rows (images only)
+        # IMPORTANT: vision_transcribe_rows must return items with indexes:
+        # { "items": [ {"i": 0, "tag": "AC-01", "block_text": "..."}, ... ] }
         tag_to_text: Dict[str, str] = {}
+        tag_to_bbox: Dict[str, List[int]] = {}
 
-        BATCH = 10
-        for i in range(0, len(row_tags), BATCH):
-            batch_tags = row_tags[i:i+BATCH]
-            batch_imgs = row_imgs_b64[i:i+BATCH]
-            batch_map = vision_transcribe_rows(batch_imgs, batch_tags)
-            tag_to_text.update(batch_map)
+        BATCH = 6  # keep small for Render stability
+        for i0 in range(0, len(row_imgs_b64), BATCH):
+            batch_imgs = row_imgs_b64[i0:i0 + BATCH]
+
+            items = vision_transcribe_rows(batch_imgs)  # <-- NOTE: no batch_tags anymore
+
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+
+                idx = it.get("i", None)
+                tag = (it.get("tag") or "").strip().upper()
+                txt = (it.get("block_text") or "").strip()
+
+                if idx is None or not isinstance(idx, int):
+                    continue
+                real_idx = i0 + idx
+                if real_idx < 0 or real_idx >= len(row_bboxes):
+                    continue
+                if not tag:
+                    continue
+
+                # Keep the best text if duplicates occur (prefer longer non-empty)
+                if tag not in tag_to_text or len(txt) > len(tag_to_text[tag]):
+                    tag_to_text[tag] = txt
+                    tag_to_bbox[tag] = row_bboxes[real_idx]
+
 
         # 5) Build response in the format Base44 expects
         blocks = []
-        for r in rows:
-            tag = (r.get("tag") or "").strip()
-            bbox_px = r.get("row_bbox_px") or [0, 0, 0, 0]
+        for tag, txt in tag_to_text.items():
+            bbox_px = tag_to_bbox.get(tag, [0, 0, 0, 0])
             y_center = (bbox_px[1] + bbox_px[3]) / 2.0
+
             blocks.append({
                 "tag": tag,
                 "y_center": y_center,
                 "region_top": bbox_px[1],
                 "region_bottom": bbox_px[3],
                 "block_no": 0,
-                "block_text": tag_to_text.get(tag, "")
+                "block_text": txt
             })
+
+        # Sort for consistency (top-to-bottom)
+        blocks.sort(key=lambda b: (b["y_center"], b["tag"]))
+
 
         return JSONResponse({
             "page": page_number,
