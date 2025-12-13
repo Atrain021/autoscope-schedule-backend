@@ -78,64 +78,143 @@ def normalize_tag_from_tokens(tokens: List[str]) -> str:
 def detect_tag_rows(page) -> List[Dict[str, Any]]:
     """
     Detect candidate finish tags + their approximate positions using the PDF text layer.
+    Handles both:
+      - inline tags like "AC-01" / "PT10S"
+      - stacked tags like "AC" above "01" (common in bubbles)
     Returns rows like:
       { tag, tag_x0, tag_y0, tag_x1, tag_y1, y_center }
     """
     words = page.get_text("words")  # (x0,y0,x1,y1,text,block,line,word)
-    # Sort by y then x
+    words = [(float(x0), float(y0), float(x1), float(y1), (t or "").strip(), b, l, w)
+             for (x0, y0, x1, y1, t, b, l, w) in words]
     words_sorted = sorted(words, key=lambda w: (w[1], w[0]))
 
-    candidates = []
+    def clean_token(s: str) -> str:
+        s = s.strip().upper()
+        # remove common punctuation but keep letters/digits
+        s = re.sub(r"[^A-Z0-9]", "", s)
+        return s
+
+    candidates: List[Dict[str, Any]] = []
+
+    # ---------
+    # A) Single-token tags: "AC-01" / "PT10S" / "WC02"
+    # ---------
+    for (x0, y0, x1, y1, t, *_rest) in words_sorted:
+        ct = clean_token(t)
+        if not ct:
+            continue
+        tag = normalize_tag_from_tokens([ct])
+        if tag:
+            candidates.append({
+                "tag": tag,
+                "tag_x0": x0,
+                "tag_y0": y0,
+                "tag_x1": x1,
+                "tag_y1": y1,
+                "y_center": (y0 + y1) / 2.0,
+            })
+
+    # ---------
+    # B) Two-token inline tags: "AC" "01" on same line
+    # ---------
     n = len(words_sorted)
+    for i in range(n - 1):
+        x0, y0, x1, y1, t1, *_ = words_sorted[i]
+        x0b, y0b, x1b, y1b, t2, *_ = words_sorted[i + 1]
 
-    for i in range(n):
-        # Try 1-token tag
-        x0, y0, x1, y1, t, *_ = words_sorted[i]
-        t = (t or "").strip()
-        if t:
-            tag = normalize_tag_from_tokens([t])
+        ct1 = clean_token(t1)
+        ct2 = clean_token(t2)
+        if not ct1 or not ct2:
+            continue
+
+        yc1 = (y0 + y1) / 2.0
+        yc2 = (y0b + y1b) / 2.0
+
+        # same-ish baseline
+        if abs(yc1 - yc2) <= 8.0 and (x0b - x1) <= 25.0:
+            tag = normalize_tag_from_tokens([ct1, ct2])
             if tag:
-                candidates.append(
-                    {
-                        "tag": tag,
-                        "tag_x0": float(x0),
-                        "tag_y0": float(y0),
-                        "tag_x1": float(x1),
-                        "tag_y1": float(y1),
-                        "y_center": float((y0 + y1) / 2.0),
-                    }
-                )
+                candidates.append({
+                    "tag": tag,
+                    "tag_x0": min(x0, x0b),
+                    "tag_y0": min(y0, y0b),
+                    "tag_x1": max(x1, x1b),
+                    "tag_y1": max(y1, y1b),
+                    "y_center": (yc1 + yc2) / 2.0,
+                })
 
-        # Try 2-token tag (AC + 01)
-        if i + 1 < n:
-            x0b, y0b, x1b, y1b, t2, *_ = words_sorted[i + 1]
-            t2 = (t2 or "").strip()
-            if t and t2:
-                # only combine if near each other vertically
-                if abs(((y0 + y1) / 2.0) - ((y0b + y1b) / 2.0)) <= 6.0:
-                    tag = normalize_tag_from_tokens([t, t2])
-                    if tag:
-                        candidates.append(
-                            {
-                                "tag": tag,
-                                "tag_x0": float(min(x0, x0b)),
-                                "tag_y0": float(min(y0, y0b)),
-                                "tag_x1": float(max(x1, x1b)),
-                                "tag_y1": float(max(y1, y1b)),
-                                "y_center": float((((y0 + y1) / 2.0) + ((y0b + y1b) / 2.0)) / 2.0),
-                            }
-                        )
+    # ---------
+    # C) Stacked tags: "AC" above "01" (x-aligned, vertically separated)
+    # ---------
+    # Index words by rough x-center to find vertical pairs
+    for i in range(n):
+        x0a, y0a, x1a, y1a, ta, *_ = words_sorted[i]
+        top = clean_token(ta)
+        if not top or not re.fullmatch(r"[A-Z]{1,4}", top):
+            continue
 
-    # De-dup: keep the leftmost instance for each tag (usually the circle label)
-    best: Dict[str, Dict[str, Any]] = {}
+        xca = (x0a + x1a) / 2.0
+
+        # look for a numeric/suffix token below it
+        for j in range(i + 1, min(i + 25, n)):  # local search window
+            x0b, y0b, x1b, y1b, tb, *_ = words_sorted[j]
+            if y0b <= y1a:  # must be below
+                continue
+
+            bot = clean_token(tb)
+            if not bot:
+                continue
+
+            # bottom should start with digits (01, 02F, 10S etc)
+            if not re.fullmatch(r"\d{1,3}[A-Z]?", bot):
+                continue
+
+            xcb = (x0b + x1b) / 2.0
+
+            # x-centers aligned (bubble stacks are very aligned)
+            if abs(xca - xcb) > 18.0:
+                continue
+
+            # vertical gap not crazy (avoid pairing across rows)
+            gap = y0b - y1a
+            if gap < 0 or gap > 40.0:
+                continue
+
+            tag = normalize_tag_from_tokens([top, bot])
+            if tag:
+                candidates.append({
+                    "tag": tag,
+                    "tag_x0": min(x0a, x0b),
+                    "tag_y0": min(y0a, y0b),
+                    "tag_x1": max(x1a, x1b),
+                    "tag_y1": max(y1a, y1b),
+                    "y_center": ((y0a + y1a) / 2.0 + (y0b + y1b) / 2.0) / 2.0,
+                })
+                break  # found the stacked pair for this top token
+
+    # ---------
+    # D) Universal false-positive filter: keep only prefixes that repeat
+    # (real schedules have many tags with same prefix: AC, WC, PT, CT, DGF...)
+    # ---------
+    # Count prefix frequency
+    prefix_counts: Dict[str, int] = {}
     for c in candidates:
+        prefix = c["tag"].split("-")[0]
+        prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
+
+    # Keep prefixes that appear at least 2 times
+    kept = [c for c in candidates if prefix_counts.get(c["tag"].split("-")[0], 0) >= 2]
+
+    # ---------
+    # E) De-dup: keep the leftmost occurrence for each tag
+    # (bubble tags tend to be furthest-left within the row)
+    # ---------
+    best: Dict[str, Dict[str, Any]] = {}
+    for c in kept:
         t = c["tag"]
-        if t not in best:
+        if t not in best or c["tag_x0"] < best[t]["tag_x0"]:
             best[t] = c
-        else:
-            # prefer smaller x0 (tag circles are usually far left of their row)
-            if c["tag_x0"] < best[t]["tag_x0"]:
-                best[t] = c
 
     rows = list(best.values())
     rows.sort(key=lambda r: (r["y_center"], r["tag_x0"]))
@@ -337,6 +416,10 @@ async def extract_finish_schedule(
 
     # 1) detect tag anchors (cheap)
     tag_rows = detect_tag_rows(page)
+    print(f"[detect_tag_rows] found {len(tag_rows)} tags on page {page_number}")
+    if tag_rows:
+        print("[detect_tag_rows] sample:", [r["tag"] for r in tag_rows[:15]])
+
     if not tag_rows:
         return {"page": page_number, "num_blocks": 0, "blocks": []}
 
@@ -344,7 +427,9 @@ async def extract_finish_schedule(
     tiles = make_tiles_for_landscape(page.rect, cols=3, rows=10, col_overlap=0.12, row_overlap=0.15)
 
     # Only keep tiles that contain at least one tag anchor (reduces OpenAI calls)
-    tiles = [t for t in tiles if tile_contains_any_tags(t, tag_rows)]
+    tag_tiles = [t for t in tiles if tile_contains_any_tags(t, tag_rows)]
+    tiles = tag_tiles if tag_tiles else tiles[:6]  # fallback to a few tiles so we can see something
+
 
     # Hard cap calls for safety; if too many, increase rows/cols intelligently later
     if len(tiles) > 22:
