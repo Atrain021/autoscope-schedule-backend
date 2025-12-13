@@ -10,6 +10,7 @@ from typing import List, Dict, Any, Optional, Tuple
 
 import fitz  # PyMuPDF
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from openai import OpenAI
