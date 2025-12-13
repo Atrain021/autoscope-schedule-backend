@@ -272,21 +272,23 @@ def vision_transcribe_grid_rows(tag_imgs_b64: List[str], desc_imgs_b64: List[str
         }
     )
 
-# With response_format json_schema, output_text should be strict JSON
-data = json.loads(resp.output_text)
-if not isinstance(data, dict) or "items" not in data:
-    return []
+    # With response_format json_schema, output_text should be strict JSON
+    data = json.loads(resp.output_text)
+    if not isinstance(data, dict) or "items" not in data:
+        return []
 
-    items = data.get("items", []) if isinstance(data, dict) else []
+    items = data.get("items", [])
     out = []
+
     for it in items:
         if not isinstance(it, dict):
             continue
+
         try:
             idx = int(it.get("i", -1))
         except Exception:
             idx = -1
-        
+
         raw_tag = str(it.get("tag", "")).strip()
         tag = normalize_tag(raw_tag)
 
@@ -299,7 +301,6 @@ if not isinstance(data, dict) or "items" not in data:
 
         # Only allow DELETED when the DESCRIPTION actually indicates it
         if block_text.upper() == "DELETED":
-            # accept deleted rows only for valid tags
             out.append({"i": idx, "tag": tag, "block_text": "DELETED"})
             continue
 
@@ -311,6 +312,7 @@ if not isinstance(data, dict) or "items" not in data:
         out.append({"i": idx, "tag": tag, "block_text": block_text})
 
     return out
+
 
 
 def png_bytes_to_cv2(png_bytes: bytes) -> np.ndarray:
