@@ -168,6 +168,57 @@ def vision_transcribe_rows(batch_imgs_b64: List[str]) -> List[Dict[str, str]]:
         })
     return out
 
+def vision_transcribe_grid_rows(tag_imgs_b64: List[str], desc_imgs_b64: List[str]) -> List[Dict[str, str]]:
+    """
+    Each row has TWO images:
+      - tag cell crop (left column)
+      - description crop (rest of row)
+    Returns list of {i, tag, block_text} where i aligns with the input order.
+    """
+    assert len(tag_imgs_b64) == len(desc_imgs_b64)
+
+    prompt = (
+        "You are reading multiple ROWS from a construction finish schedule.\n"
+        "Each ROW i is provided as TWO images:\n"
+        "  - Image A(i): the TAG cell (left column)\n"
+        "  - Image B(i): the DESCRIPTION area for the SAME ROW\n\n"
+        "For each row i:\n"
+        "1) Read the finish TAG from Image A(i). Normalize to PREFIX-NUMBER with optional suffix (AC-01, PT-06F, CT-10).\n"
+        "2) Read the description text from Image B(i). Include only text that belongs to that row.\n"
+        "3) Only return block_text=\"DELETED\" if the word DELETED appears in that row.\n"
+        "4) If no clear tag is present, return tag=\"\" and block_text=\"\".\n"
+        "5) You MUST return exactly one item for every row index i.\n\n"
+        "Return STRICT JSON ONLY:\n"
+        "{ \"items\": [ {\"i\": 0, \"tag\": \"AC-01\", \"block_text\": \"...\"}, ... ] }\n"
+    )
+
+    content = [{"type": "input_text", "text": prompt}]
+    for i, (a, b) in enumerate(zip(tag_imgs_b64, desc_imgs_b64)):
+        content.append({"type": "input_text", "text": f"ROW {i}: Image A then Image B"})
+        content.append({"type": "input_image", "image_url": f"data:image/png;base64,{a}"})
+        content.append({"type": "input_image", "image_url": f"data:image/png;base64,{b}"})
+
+    resp = client.responses.create(
+        model="gpt-4o",
+        input=[{"role": "user", "content": content}],
+    )
+
+    data = safe_json_loads(resp.output_text)
+    items = data.get("items", []) if isinstance(data, dict) else []
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        try:
+            idx = int(it.get("i", -1))
+        except Exception:
+            idx = -1
+        out.append({
+            "i": idx,
+            "tag": str(it.get("tag", "")).strip().upper(),
+            "block_text": str(it.get("block_text", "")).strip()
+        })
+    return out
 
 
 def png_bytes_to_cv2(png_bytes: bytes) -> np.ndarray:
@@ -229,6 +280,45 @@ def detect_horizontal_lines(img: np.ndarray) -> List[int]:
     for y in ys:
         if not dedup or abs(y - dedup[-1]) > 4:
             dedup.append(y)
+    return dedup
+def detect_vertical_lines(img: np.ndarray) -> List[int]:
+    """
+    Return x positions (pixels) of detected vertical table grid lines.
+    Works best on schedules with visible column lines.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    inv = 255 - gray
+    _, bw = cv2.threshold(inv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    h, w = bw.shape
+
+    # Long vertical kernel to extract column lines
+    kernel_len = max(25, h // 25)
+    vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_len))
+
+    vert = cv2.erode(bw, vert_kernel, iterations=1)
+    vert = cv2.dilate(vert, vert_kernel, iterations=2)
+
+    contours, _ = cv2.findContours(vert, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    xs = []
+    for c in contours:
+        x, y, ww, hh = cv2.boundingRect(c)
+        # filter out short junk lines
+        if hh > h * 0.20:
+            xs.append(x)
+
+    xs = sorted(xs)
+    # de-duplicate close x positions
+    dedup = []
+    for x in xs:
+        if not dedup or abs(x - dedup[-1]) > 8:
+            dedup.append(x)
+
+    # also add right-most boundary if missing (makes cropping safer)
+    if dedup and (w - dedup[-1] > 20):
+        dedup.append(w - 1)
+
     return dedup
 
 def detect_bubbles(img: np.ndarray) -> List[Dict[str, Any]]:
@@ -687,6 +777,33 @@ def vision_extract_for_tile(image_url: str, tag_list: List[str]) -> Dict[str, st
                 out[t] = bt
     return out
 
+def detect_vertical_lines(img: np.ndarray) -> List[int]:
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    inv = 255 - gray
+    _, bw = cv2.threshold(inv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    h, w = bw.shape
+    kernel_len = max(20, h // 30)
+    vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_len))
+
+    vert = cv2.erode(bw, vert_kernel, iterations=1)
+    vert = cv2.dilate(vert, vert_kernel, iterations=2)
+
+    contours, _ = cv2.findContours(vert, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    xs = []
+    for c in contours:
+        x, y, ww, hh = cv2.boundingRect(c)
+        if hh > h * 0.15:
+            xs.append(x)
+
+    xs = sorted(xs)
+    dedup = []
+    for x in xs:
+        if not dedup or abs(x - dedup[-1]) > 6:
+            dedup.append(x)
+    return dedup
+
 
 # -----------------------------
 # Endpoint: extract schedule
@@ -797,22 +914,104 @@ def extract_finish_schedule_vision(
         page_png, scale = render_page_png(doc, page_number, max_width_px=2200)
         page_b64 = b64_png(page_png)
 
-        # 2) OpenCV detects row geometry (universal)
+        # 2) Detect grid lines (this is the core of "perfect")
         page_img = png_bytes_to_cv2(page_png)
         hlines = detect_horizontal_lines(page_img)
-        bubbles = detect_bubbles(page_img)
-        row_boxes = build_row_boxes(page_img, bubbles, hlines)
+        vlines = detect_vertical_lines(page_img)
 
-        print(f"[cv_rows] hlines={len(hlines)} bubbles={len(bubbles)} row_boxes={len(row_boxes)}")
+        h, w = page_img.shape[:2]
+        print(f"[grid] hlines={len(hlines)} vlines={len(vlines)}")
 
-        # Convert row_boxes -> rows structure expected by downstream logic
-        rows = []
-        for bb in row_boxes:
-            x0, y0, x1, y1 = bb
-            rows.append({
-                "tag": "",  # we will read tag from the row crop using GPT
-                "row_bbox_px": [x0, y0, x1, y1]
-            })
+        # If grid detection is weak, fallback to old method (rare case)
+        if len(hlines) < 6 or len(vlines) < 4:
+            bubbles = detect_bubbles(page_img)
+            row_boxes = build_row_boxes(page_img, bubbles, hlines)
+            print(f"[fallback_rows] bubbles={len(bubbles)} row_boxes={len(row_boxes)}")
+
+            rows = []
+            for bb in row_boxes:
+                x0, y0, x1, y1 = bb
+                rows.append({"row_bbox_px": [x0, y0, x1, y1]})
+
+            # For fallback, we will treat each row bbox as the whole row image
+            row_imgs_b64 = []
+            row_bboxes = []
+            for r in rows:
+                bbox_px = r.get("row_bbox_px")
+                row_png = crop_png_bytes(page_png, bbox_px)
+                if not row_png:
+                    continue
+                row_imgs_b64.append(b64_png(row_png))
+                row_bboxes.append(bbox_px)
+
+            # We'll transcribe from whole-row crops in fallback mode
+            mode = "fallback"
+
+        else:
+            # GRID MODE: rows = each gap between adjacent horizontal lines
+            # Choose TAG column as the narrow column near the left (most schedules)
+            # Candidate columns are between vlines[j]..vlines[j+1]
+            col_ranges = []
+            for j in range(len(vlines) - 1):
+                x0 = vlines[j]
+                x1 = vlines[j + 1]
+                col_ranges.append((j, x0, x1, x1 - x0))
+
+            # Pick the earliest narrow column as the tag column
+            # (narrow and near left side is almost always the tag)
+            col_ranges_sorted = sorted(col_ranges, key=lambda t: (t[1], t[3]))
+            tag_col_j, tag_x0, tag_x1, _ = col_ranges_sorted[0]
+
+            # Description region starts at the next vertical line after tag column
+            desc_x0 = tag_x1
+            desc_x1 = w - 1
+
+            print(f"[grid_cols] tag_col={tag_col_j} tag_x0={tag_x0} tag_x1={tag_x1} desc_x0={desc_x0}")
+
+            # Build row crops: (tag cell crop, description region crop) per row
+            row_imgs_b64 = []
+            row_bboxes = []  # store [x0,y0,x1,y1] of full row
+            row_tag_cells = []
+            row_desc_cells = []
+
+            # Use each band between horizontal lines as a row
+            for i in range(len(hlines) - 1):
+                y0 = hlines[i]
+                y1 = hlines[i + 1]
+                if y1 - y0 < 10:
+                    continue
+
+                # full row bbox (for returning y_center etc.)
+                full_bbox = [0, y0, w - 1, y1]
+
+                # tag cell bbox and desc bbox
+                tag_bbox = [tag_x0, y0, tag_x1, y1]
+                desc_bbox = [desc_x0, y0, desc_x1, y1]
+
+                tag_png = crop_png_bytes(page_png, tag_bbox)
+                desc_png = crop_png_bytes(page_png, desc_bbox)
+
+                if not tag_png or not desc_png:
+                    continue
+
+                # Optional: downscale desc to reduce memory
+                desc_img = png_bytes_to_cv2(desc_png)
+                dh, dw = desc_img.shape[:2]
+                max_dw = 1400
+                if dw > max_dw:
+                    s = max_dw / float(dw)
+                    desc_img = cv2.resize(desc_img, (int(dw * s), int(dh * s)), interpolation=cv2.INTER_AREA)
+                    ok, out = cv2.imencode(".png", desc_img)
+                    if ok:
+                        desc_png = out.tobytes()
+
+                row_tag_cells.append(b64_png(tag_png))
+                row_desc_cells.append(b64_png(desc_png))
+                row_bboxes.append(full_bbox)
+
+            mode = "grid"
+            print(f"[grid_rows] rows={len(row_bboxes)}")
+
 
 
         # 3) Crop each row bbox to its own image (using PDF clip rect)
@@ -842,46 +1041,44 @@ def extract_finish_schedule_vision(
             row_bboxes.append(bbox_px)
 
 
-        # 4) Batch transcribe rows (images only)
-        # IMPORTANT: vision_transcribe_rows must return items with indexes:
-        # { "items": [ {"i": 0, "tag": "AC-01", "block_text": "..."}, ... ] }
+        # 4) Batch transcribe
         tag_to_text: Dict[str, str] = {}
         tag_to_bbox: Dict[str, List[int]] = {}
 
-        BATCH = 6  # keep small for Render stability
-        for i0 in range(0, len(row_imgs_b64), BATCH):
-            batch_imgs = row_imgs_b64[i0:i0 + BATCH]
+        BATCH = 4  # two images per row; keep batch small
+        n = len(row_bboxes)
 
-            items = vision_transcribe_rows(batch_imgs)  # <-- NOTE: no batch_tags anymore
+        for i0 in range(0, n, BATCH):
+            batch_tag_imgs = row_tag_cells[i0:i0 + BATCH]
+            batch_desc_imgs = row_desc_cells[i0:i0 + BATCH]
+
+            items = vision_transcribe_grid_rows(batch_tag_imgs, batch_desc_imgs)
 
             for it in items:
-                if not isinstance(it, dict):
-                    continue
-
-                idx = it.get("i", None)
+                idx = it.get("i", -1)
                 tag = (it.get("tag") or "").strip().upper()
                 txt = (it.get("block_text") or "").strip()
 
-                if idx is None or not isinstance(idx, int):
+                if not isinstance(idx, int):
                     continue
                 real_idx = i0 + idx
-                if real_idx < 0 or real_idx >= len(row_bboxes):
+                if real_idx < 0 or real_idx >= n:
                     continue
                 if not tag:
                     continue
 
-                # Keep the best text if duplicates occur (prefer longer non-empty)
+                # keep best (prefer longer non-empty)
                 if tag not in tag_to_text or len(txt) > len(tag_to_text[tag]):
                     tag_to_text[tag] = txt
                     tag_to_bbox[tag] = row_bboxes[real_idx]
 
 
-        # 5) Build response in the format Base44 expects
+
+        # 5) Build response
         blocks = []
         for tag, txt in tag_to_text.items():
             bbox_px = tag_to_bbox.get(tag, [0, 0, 0, 0])
             y_center = (bbox_px[1] + bbox_px[3]) / 2.0
-
             blocks.append({
                 "tag": tag,
                 "y_center": y_center,
@@ -891,8 +1088,8 @@ def extract_finish_schedule_vision(
                 "block_text": txt
             })
 
-        # Sort for consistency (top-to-bottom)
         blocks.sort(key=lambda b: (b["y_center"], b["tag"]))
+
 
 
         return JSONResponse({
