@@ -325,6 +325,30 @@ def score_block_text(s: str) -> int:
     return max(0, length) + labels * 60
 
 
+def safe_json_loads(text: str) -> Dict[str, Any]:
+    """
+    Tries to parse JSON even if wrapped in code fences or extra text.
+    """
+    if not text:
+        raise ValueError("Empty response text")
+
+    t = text.strip()
+
+    # Strip common code fences
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+        t = re.sub(r"\s*```$", "", t).strip()
+
+    # If still not pure JSON, extract first {...} block
+    if not (t.startswith("{") and t.endswith("}")):
+        m = re.search(r"\{.*\}", t, flags=re.DOTALL)
+        if not m:
+            raise ValueError(f"No JSON object found in response: {text[:200]}")
+        t = m.group(0)
+
+    return json.loads(t)
+
+
 # -----------------------------
 # Vision extraction per tile
 # -----------------------------
@@ -377,7 +401,7 @@ def vision_extract_for_tile(image_url: str, tag_list: List[str]) -> Dict[str, st
     )
 
     raw = resp.output_text
-    data = json.loads(raw)
+    data = safe_json_loads(raw)
 
     out: Dict[str, str] = {}
     items = data.get("items", []) if isinstance(data, dict) else []
@@ -437,6 +461,8 @@ async def extract_finish_schedule(
 
     # 3) For each tile, run vision and merge results
     best_by_tag: Dict[str, Dict[str, Any]] = {}  # tag -> {text, score}
+    print(f"[tiles] using {len(tiles)} tiles on page {page_number}")
+    print(f"[tags] detected {len(tag_rows)} tags on page {page_number}")
 
     for tile in tiles:
         tile_tags = tags_in_tile(tile, tag_rows)
@@ -447,8 +473,12 @@ async def extract_finish_schedule(
 
         try:
             extracted = vision_extract_for_tile(img_url, tile_tags)
-        except Exception:
+        except Exception as e:
+            print("❌ Vision extract failed:", repr(e))
+            # (Optional) print the first few tags so we know what tile was being processed
+            print("   tile tag sample:", tile_tags[:10])
             extracted = {}
+
 
         for t in tile_tags:
             bt = extracted.get(t, "") if extracted else ""
