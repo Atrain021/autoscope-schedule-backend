@@ -168,6 +168,46 @@ def vision_transcribe_rows(batch_imgs_b64: List[str]) -> List[Dict[str, str]]:
         })
     return out
 
+TAG_RE = re.compile(r"^([A-Z]{1,4})-(\d{1,3})([A-Z]?)$")
+
+def normalize_tag(raw: str) -> str:
+    if not raw:
+        return ""
+    s = raw.strip().upper()
+    # common OCR quirks: "AC 01", "AC01", "AC-01"
+    s = re.sub(r"[\s_]+", "-", s)
+    s = s.replace("--", "-")
+    s = s.replace("–", "-").replace("—", "-")
+
+    # if no dash but looks like letters+digits, insert dash
+    m = re.match(r"^([A-Z]{1,4})-?(\d{1,3})([A-Z]?)$", s.replace("-", ""))
+    if not m:
+        # try simpler form like "AC-01F" etc already handled above
+        m2 = re.match(r"^([A-Z]{1,4})-(\d{1,3})([A-Z]?)$", s)
+        if not m2:
+            return ""
+        return f"{m2.group(1)}-{int(m2.group(2)):02d}{m2.group(3)}".rstrip()
+    prefix, num, suf = m.group(1), m.group(2), m.group(3)
+    return f"{prefix}-{int(num):02d}{suf}".rstrip()
+
+def is_valid_tag(tag: str) -> bool:
+    if not tag:
+        return False
+    if tag in {"DELETED", "DELETE", "VOID", "N/A", "NA"}:
+        return False
+    return bool(TAG_RE.match(tag))
+
+def looks_like_finish_row_text(txt: str) -> bool:
+    """
+    Universal-ish sanity: most finish rows contain at least one of these tokens.
+    Prevents headers/notes/addresses from being treated as row descriptions.
+    """
+    if not txt:
+        return False
+    t = txt.upper()
+    return any(k in t for k in ["MFR", "MANUF", "PROD", "PRODUCT", "COLOR", "FINISH", "SIZE", "LOC", "LOCATION", "PATT", "PATTERN", "STYLE", "SERIES", "SKU", "COL:"])
+
+
 def vision_transcribe_grid_rows(tag_imgs_b64: List[str], desc_imgs_b64: List[str]) -> List[Dict[str, str]]:
     """
     Each row has TWO images:
@@ -178,19 +218,21 @@ def vision_transcribe_grid_rows(tag_imgs_b64: List[str], desc_imgs_b64: List[str
     assert len(tag_imgs_b64) == len(desc_imgs_b64)
 
     prompt = (
-        "You are reading multiple ROWS from a construction finish schedule.\n"
-        "Each ROW i is provided as TWO images:\n"
-        "  - Image A(i): the TAG cell (left column)\n"
-        "  - Image B(i): the DESCRIPTION area for the SAME ROW\n\n"
-        "For each row i:\n"
-        "1) Read the finish TAG from Image A(i). Normalize to PREFIX-NUMBER with optional suffix (AC-01, PT-06F, CT-10).\n"
-        "2) Read the description text from Image B(i). Include only text that belongs to that row.\n"
-        "3) Only return block_text=\"DELETED\" if the word DELETED appears in that row.\n"
-        "4) If no clear tag is present, return tag=\"\" and block_text=\"\".\n"
-        "5) You MUST return exactly one item for every row index i.\n\n"
-        "Return STRICT JSON ONLY:\n"
-        "{ \"items\": [ {\"i\": 0, \"tag\": \"AC-01\", \"block_text\": \"...\"}, ... ] }\n"
-    )
+    "You are reading multiple ROWS from a construction finish schedule.\n"
+    "Each ROW i is provided as TWO images:\n"
+    "  - Image A(i): the TAG cell (left column)\n"
+    "  - Image B(i): the DESCRIPTION area for the SAME ROW\n\n"
+    "For each row i:\n"
+    "1) Read the finish TAG from Image A(i). It will look like letters + numbers (sometimes with a suffix), e.g. AC-01, PT-06F, CT-10.\n"
+    "   - The TAG is NEVER the word 'DELETED'.\n"
+    "   - If you do not see a real tag pattern in Image A(i), return tag=\"\".\n"
+    "2) Read the description text from Image B(i). Keep ONLY what belongs to that row.\n"
+    "3) Only return block_text=\"DELETED\" if the literal word DELETED appears in the DESCRIPTION for that same row.\n"
+    "4) You MUST return exactly one item for every row index i.\n\n"
+    "Return STRICT JSON ONLY:\n"
+    "{ \"items\": [ {\"i\": 0, \"tag\": \"AC-01\", \"block_text\": \"...\"}, ... ] }\n"
+)
+
 
     content = [{"type": "input_text", "text": prompt}]
     for i, (a, b) in enumerate(zip(tag_imgs_b64, desc_imgs_b64)):
@@ -213,11 +255,30 @@ def vision_transcribe_grid_rows(tag_imgs_b64: List[str], desc_imgs_b64: List[str
             idx = int(it.get("i", -1))
         except Exception:
             idx = -1
-        out.append({
-            "i": idx,
-            "tag": str(it.get("tag", "")).strip().upper(),
-            "block_text": str(it.get("block_text", "")).strip()
-        })
+        
+        raw_tag = str(it.get("tag", "")).strip()
+        tag = normalize_tag(raw_tag)
+
+        block_text = str(it.get("block_text", "")).strip()
+
+        # If the model mistakenly returns DELETED as the tag, drop it
+        if not is_valid_tag(tag):
+            out.append({"i": idx, "tag": "", "block_text": ""})
+            continue
+
+        # Only allow DELETED when the DESCRIPTION actually indicates it
+        if block_text.upper() == "DELETED":
+            # accept deleted rows only for valid tags
+            out.append({"i": idx, "tag": tag, "block_text": "DELETED"})
+            continue
+
+        # If row text doesn't resemble finish info, treat it as empty
+        if not looks_like_finish_row_text(block_text):
+            out.append({"i": idx, "tag": "", "block_text": ""})
+            continue
+
+        out.append({"i": idx, "tag": tag, "block_text": block_text})
+
     return out
 
 
