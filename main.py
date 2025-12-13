@@ -243,9 +243,40 @@ def vision_transcribe_grid_rows(tag_imgs_b64: List[str], desc_imgs_b64: List[str
     resp = client.responses.create(
         model="gpt-4o",
         input=[{"role": "user", "content": content}],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "row_transcription",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "i": {"type": "integer"},
+                                    "tag": {"type": "string"},
+                                    "block_text": {"type": "string"}
+                                },
+                                "required": ["i", "tag", "block_text"],
+                                "additionalProperties": False
+                            }
+                        }
+                    },
+                    "required": ["items"],
+                    "additionalProperties": False
+                },
+                "strict": True
+            }
+        }
     )
 
-    data = safe_json_loads(resp.output_text)
+# With response_format json_schema, output_text should be strict JSON
+data = json.loads(resp.output_text)
+if not isinstance(data, dict) or "items" not in data:
+    return []
+
     items = data.get("items", []) if isinstance(data, dict) else []
     out = []
     for it in items:
