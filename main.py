@@ -57,6 +57,30 @@ def render_page_png(doc: fitz.Document, page_number: int, max_width_px: int = 22
     png_bytes = pix.tobytes("png")
     return png_bytes, scale
 
+def parse_json_loose(text: str):
+    """
+    Tries to parse JSON even if the model adds extra text or has minor issues.
+    Returns dict or None.
+    """
+    if not text:
+        return None
+
+    # 1) Try direct parse
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # 2) Extract the first {...} block
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if m:
+        candidate = m.group(0)
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+    return None
 
 def b64_png(png_bytes: bytes) -> str:
     return base64.b64encode(png_bytes).decode("utf-8")
@@ -86,6 +110,7 @@ def vision_detect_rows(page_png_b64: str) -> List[Dict[str, Any]]:
         "- Only include items that are clearly row markers (bubbles) starting a schedule row.\n"
         "- Ignore page titles, sheet numbers (like I-601), notes, or random text that is not a row marker.\n"
         "- If you are unsure a marker is a row marker, do not include it.\n"
+        "IMPORTANT: If block_text contains any double quotes (\") you MUST escape them as \\\" so the JSON is valid.\n"
         "- Return strict JSON only.\n\n"
         "OUTPUT JSON:\n"
         "{ \"rows\": [ { \"tag\": \"AC-01\", \"row_bbox_px\": [x0,y0,x1,y1] }, ... ] }\n"
@@ -124,20 +149,20 @@ def vision_transcribe_rows(batch_imgs_b64: List[str]) -> List[Dict[str, str]]:
     Output list index must match input image index.
     """
     prompt = (
-        "You are reading one or more IMAGE crops from a construction finish schedule.\n"
-        "IMPORTANT: Each image shows exactly ONE schedule ROW.\n\n"
-        "For EACH image i (starting at i=0 in the order provided):\n"
-        "1) Read the row's TAG from the left-side marker/bubble.\n"
-        "   Normalize to PREFIX-NUMBER with optional suffix (examples: AC-01, PT-06F, CT-10).\n"
-        "2) Extract ONLY the description text that belongs to that SAME ROW.\n"
-        "   Do NOT include text from any other row.\n"
-        "3) Only output block_text=\"DELETED\" if the literal word DELETED appears in that row.\n"
-        "   Otherwise never guess DELETED.\n"
-        "4) If you cannot confidently read a tag, return tag=\"\" for that image.\n"
-        "5) You MUST return exactly one JSON item for every image index i.\n\n"
-        "Return STRICT JSON ONLY in this exact shape:\n"
-        "{ \"items\": [ {\"i\": 0, \"tag\": \"AC-01\", \"block_text\": \"...\"}, {\"i\": 1, \"tag\": \"\", \"block_text\": \"\"}, ... ] }\n"
-    )
+    "You are reading one or more IMAGE crops of rows from a construction finish schedule.\n"
+    "Each image shows exactly ONE schedule ROW.\n\n"
+    "For EACH image:\n"
+    "1) Read the row's TAG from the row marker/bubble at the left.\n"
+    "   Normalize tags to: PREFIX-NUMBER with optional suffix (examples: AC-01, PT-06F, CT-10).\n"
+    "2) Extract the row's description text that belongs ONLY to that row.\n"
+    "   Do not include text from other rows.\n"
+    "3) If the row explicitly says DELETED in the same row, block_text must be \"DELETED\".\n"
+    "   Otherwise never guess DELETED.\n\n"
+    "IMPORTANT: If block_text contains any double quotes (\") you MUST escape them as \\\" so the JSON is valid.\n\n"
+    "Return STRICT JSON ONLY:\n"
+    "{ \"items\": [ {\"i\": 0, \"tag\": \"AC-01\", \"block_text\": \"...\"}, ... ] }\n"
+)
+
 
 
     content = [{"type": "input_text", "text": prompt}]
@@ -229,6 +254,7 @@ def vision_transcribe_grid_rows(tag_imgs_b64: List[str], desc_imgs_b64: List[str
     "2) Read the description text from Image B(i). Keep ONLY what belongs to that row.\n"
     "3) Only return block_text=\"DELETED\" if the literal word DELETED appears in the DESCRIPTION for that same row.\n"
     "4) You MUST return exactly one item for every row index i.\n\n"
+    "IMPORTANT: If block_text contains any double quotes (\") you MUST escape them as \\\" so the JSON is valid.\n"
     "Return STRICT JSON ONLY:\n"
     "{ \"items\": [ {\"i\": 0, \"tag\": \"AC-01\", \"block_text\": \"...\"}, ... ] }\n"
 )
@@ -243,37 +269,23 @@ def vision_transcribe_grid_rows(tag_imgs_b64: List[str], desc_imgs_b64: List[str
     resp = client.responses.create(
         model="gpt-4o",
         input=[{"role": "user", "content": content}],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "row_transcription",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "items": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "i": {"type": "integer"},
-                                    "tag": {"type": "string"},
-                                    "block_text": {"type": "string"}
-                                },
-                                "required": ["i", "tag", "block_text"],
-                                "additionalProperties": False
-                            }
-                        }
-                    },
-                    "required": ["items"],
-                    "additionalProperties": False
-                },
-                "strict": True
-            }
-        }
+        
     )
 
     # With response_format json_schema, output_text should be strict JSON
-    data = json.loads(resp.output_text)
+    data = parse_json_loose(resp.output_text)
+
+    # Retry once if JSON failed
+    if data is None:
+        resp2 = client.responses.create(
+            model="gpt-4o",
+            input=[{"role": "user", "content": content}],
+        )
+        data = parse_json_loose(resp2.output_text)
+
+    if data is None or not isinstance(data, dict) or "items" not in data:
+        return []
+
     if not isinstance(data, dict) or "items" not in data:
         return []
 
@@ -836,6 +848,7 @@ def vision_extract_for_tile(image_url: str, tag_list: List[str]) -> Dict[str, st
     "If not sure, do NOT guess DELETED.\n\n"
     "MISSING RULE:\n"
     "If you cannot confidently find the tag in this image crop, return block_text=\"\" for that tag.\n\n"
+    "IMPORTANT: If block_text contains any double quotes (\") you MUST escape them as \\\" so the JSON is valid.\n"
     f"REQUESTED TAGS (extract ONLY these): {tags_str}\n\n"
     "OUTPUT JSON ONLY (no extra text):\n"
     "{ \"items\": [ { \"tag\": \"AC-01\", \"block_text\": \"...\" }, ... ] }\n"
