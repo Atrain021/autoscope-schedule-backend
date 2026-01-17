@@ -23,9 +23,6 @@ from openai import OpenAI
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-# Serve uploaded PDFs publicly so Base44 can pass a URL into InvokeLLM
-app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
-
 
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -36,6 +33,8 @@ app = FastAPI(
     description="AI-powered construction schedule extraction",
     version="2.0.0"
 )
+# Serve uploaded PDFs publicly so Base44 can pass a URL into InvokeLLM
+app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 # CORS for Base44 integration
 app.add_middleware(
