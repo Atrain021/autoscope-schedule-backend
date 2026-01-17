@@ -10,9 +10,10 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from fastapi.staticfiles import StaticFiles
 
 from openai import OpenAI
 
@@ -21,6 +22,10 @@ from openai import OpenAI
 # -----------------------------
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
+
+# Serve uploaded PDFs publicly so Base44 can pass a URL into InvokeLLM
+app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
+
 
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -243,8 +248,13 @@ async def upload_pdf(file: UploadFile = File(...)):
         with open(filepath, "wb") as f:
             f.write(content)
         
+        base_url = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+        pdf_url = f"{base_url}/uploads/{filename}" if base_url else f"/uploads/{filename}"
+
+
         return JSONResponse({
             "filename": filename,
+            "pdf_url": pdf_url,
             "size": len(content),
             "original_filename": file.filename
         })
