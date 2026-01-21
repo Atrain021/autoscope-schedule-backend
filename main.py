@@ -11,7 +11,6 @@ from pathlib import Path
 import fitz  # PyMuPDF
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 
@@ -33,9 +32,19 @@ app = FastAPI(
     description="AI-powered construction schedule extraction",
     version="2.0.0"
 )
+
+from fastapi import Request
+from fastapi.responses import Response
+
+@app.options("/{path:path}")
+async def preflight_handler(path: str, request: Request):
+    return Response(status_code=200)
+
+
 # Serve uploaded PDFs publicly so Base44 can pass a URL into InvokeLLM
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
+from fastapi.middleware.cors import CORSMiddleware
 # CORS for Base44 integration
 app.add_middleware(
     CORSMiddleware,
