@@ -80,32 +80,67 @@ class ScheduleExtractor:
     def __init__(self):
         self.client = client
     
-    def pdf_page_to_image(self, pdf_path: str, page_number: int, dpi: int = 300) -> bytes:
+    import fitz  # PyMuPDF
+    import gc
+
+    def pdf_page_to_image(
+        self,
+        pdf_path: str,
+        page_number: int,
+        dpi: int = 300,
+        *,
+        purpose: str = "extract",     # "extract" or "classify"
+        jpeg_quality: int = 70
+    ) -> bytes:
         """
-        Convert PDF page to high-resolution PNG image.
-        High DPI ensures schedule text is crisp for vision models.
+        Convert a PDF page to an image.
+
+        - purpose="extract": high-quality PNG (default) for reading small schedule text
+        - purpose="classify": low-memory grayscale JPEG for page classification
+
+        Returns: image bytes
         """
+        doc = None
         try:
             doc = fitz.open(pdf_path)
-            
-            # Validate page number
+
             if page_number < 0 or page_number >= len(doc):
                 raise ValueError(f"Invalid page number {page_number}. PDF has {len(doc)} pages.")
-            
+
             page = doc[page_number]
-            
-            # Render at high resolution (300 DPI)
-            mat = fitz.Matrix(dpi/72, dpi/72)
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            
-            # Convert to PNG bytes
-            img_bytes = pix.tobytes("png")
-            doc.close()
-            
+
+            # Classification should NOT render at high DPI (memory killer)
+            if purpose == "classify":
+                dpi = min(int(dpi), 72)  # hard cap for safety (60–72 is plenty)
+
+            # Render
+            mat = fitz.Matrix(dpi / 72, dpi / 72)
+
+            if purpose == "classify":
+                # Grayscale drastically reduces memory; JPEG reduces bytes further
+                pix = page.get_pixmap(matrix=mat, alpha=False, colorspace=fitz.csGRAY)
+                img_bytes = pix.tobytes("jpeg", jpg_quality=int(jpeg_quality))
+            else:
+                # Extraction mode: keep crisp PNG
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                img_bytes = pix.tobytes("png")
+
+            # Free big objects ASAP
+            del pix
+            del page
+            gc.collect()
+
             return img_bytes
-            
+
         except Exception as e:
             raise Exception(f"PDF to image conversion failed: {str(e)}")
+        finally:
+            try:
+                if doc is not None:
+                    doc.close()
+            except Exception:
+                pass
+
     
     def extract_schedule_tags(self, image_bytes: bytes, requested_tags: List[str]) -> Dict[str, str]:
         """
@@ -357,7 +392,7 @@ class ClassifyPdfRequest(BaseModel):
     filename: str
     start_page: int = 1          # 1-based inclusive
     end_page: Optional[int] = None  # 1-based inclusive (None = through end)
-    dpi: int = 150               # lower DPI is faster for classification
+    dpi: int = 72               # lower DPI is faster for classification
 
 def _clean_json_text(text: str) -> str:
     """Remove ```json fences if present."""
@@ -463,7 +498,13 @@ async def classify_pdf(request: ClassifyPdfRequest):
 
         for page_number in range(start, end + 1):
             page_index = page_number - 1  # 0-based
-            image_bytes = extractor.pdf_page_to_image(str(filepath), page_index, dpi=int(request.dpi))
+            image_bytes = extractor.pdf_page_to_image(
+                str(filepath),
+                page_index,
+                dpi=int(request.dpi),
+                purpose="classify"
+            )
+
 
             page_info = _classify_single_page(image_bytes)
             pages_out.append({
