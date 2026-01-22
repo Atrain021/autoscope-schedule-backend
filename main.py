@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 
 from openai import OpenAI
+from typing import Optional, Dict, List
 
 # -----------------------------
 # Configuration
@@ -343,6 +344,140 @@ async def extract_finish_schedule_by_tags(request: ExtractByTagsRequest):
             status_code=500,
             detail=f"Extraction failed: {str(e)}"
         )
+
+class ClassifyPdfRequest(BaseModel):
+    filename: str
+    start_page: int = 1          # 1-based inclusive
+    end_page: Optional[int] = None  # 1-based inclusive (None = through end)
+    dpi: int = 150               # lower DPI is faster for classification
+
+def _clean_json_text(text: str) -> str:
+    """Remove ```json fences if present."""
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = re.sub(r'^```[a-zA-Z]*\n', '', t)
+        t = re.sub(r'\n```$', '', t)
+        t = t.strip()
+    return t
+
+
+def _classify_single_page(image_bytes: bytes) -> Dict[str, str]:
+    """
+    Classify a single PDF page image as FINISH_SCHEDULE / FLOOR_PLAN / OTHER.
+    Also attempt to read sheet_identifier and sheet_title if visible.
+    """
+    base64_image = base64.b64encode(image_bytes).decode("utf-8")
+
+    prompt = """You are looking at ONE page from a construction drawing PDF.
+
+Classify the page visually into exactly one of:
+- FINISH_SCHEDULE (table/schedule with rows/columns, finish tags like AC-01/PT-02/etc)
+- FLOOR_PLAN (plan view with rooms/walls/dimensions/tags)
+- OTHER (everything else)
+
+Also extract if visible:
+- sheet_identifier (ex: I-601, A-201, ID-411, etc.)
+- sheet_title (ex: "LEVEL 1 FLOOR PLAN", "FINISH SCHEDULE", etc.)
+
+Return ONLY valid JSON in exactly this format:
+{
+  "classification": "FINISH_SCHEDULE",
+  "sheet_identifier": "I-601",
+  "sheet_title": "FINISH SCHEDULE"
+}
+
+Rules:
+- If sheet_identifier/title are not clearly visible, return "" for them.
+- No markdown. No extra text. JSON only.
+"""
+
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{base64_image}",
+                            "detail": "high",
+                        },
+                    },
+                ],
+            }
+        ],
+        max_tokens=400,
+        temperature=0.0,
+    )
+
+    raw = resp.choices[0].message.content.strip()
+    cleaned = _clean_json_text(raw)
+    data = json.loads(cleaned)
+
+    # Hard normalize classification
+    cls = (data.get("classification") or "").strip().upper()
+    if cls not in {"FINISH_SCHEDULE", "FLOOR_PLAN", "OTHER"}:
+        cls = "OTHER"
+
+    return {
+        "classification": cls,
+        "sheet_identifier": (data.get("sheet_identifier") or "").strip(),
+        "sheet_title": (data.get("sheet_title") or "").strip(),
+    }
+
+
+@app.post("/classify-pdf")
+async def classify_pdf(request: ClassifyPdfRequest):
+    """
+    Classify pages in an uploaded PDF (stored in /uploads) WITHOUT using Base44 InvokeLLM.
+    This is specifically to handle PDFs >10MB that Base44 rejects.
+    """
+    try:
+        filepath = UPLOAD_DIR / request.filename
+        if not filepath.exists():
+            raise HTTPException(status_code=404, detail=f"PDF file not found: {request.filename}")
+
+        doc = fitz.open(str(filepath))
+        total_pages = len(doc)
+
+        # Convert user range (1-based) -> python range (0-based)
+        start = max(1, int(request.start_page))
+        end = int(request.end_page) if request.end_page else total_pages
+        end = min(end, total_pages)
+
+        if start > end:
+            raise HTTPException(status_code=422, detail="start_page must be <= end_page")
+
+        extractor = ScheduleExtractor()
+        pages_out = []
+
+        for page_number in range(start, end + 1):
+            page_index = page_number - 1  # 0-based
+            image_bytes = extractor.pdf_page_to_image(str(filepath), page_index, dpi=int(request.dpi))
+
+            page_info = _classify_single_page(image_bytes)
+            pages_out.append({
+                "page_number": page_number,  # keep 1-based in output
+                "classification": page_info["classification"],
+                "sheet_identifier": page_info["sheet_identifier"],
+                "sheet_title": page_info["sheet_title"],
+            })
+
+        doc.close()
+
+        return JSONResponse({
+            "filename": request.filename,
+            "total_pages": total_pages,
+            "pages": pages_out
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Classification failed: {str(e)}")
+
 # -----------------------------
 # Utility Functions
 # -----------------------------
