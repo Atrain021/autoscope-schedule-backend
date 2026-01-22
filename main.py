@@ -46,14 +46,22 @@ async def preflight_handler(path: str, request: Request):
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 from fastapi.middleware.cors import CORSMiddleware
-# CORS for Base44 integration
+
+# CORS for Base44 + local testing
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_origin_regex=r"^https://.*\.base44\.app$",
+    allow_credentials=False,  # IMPORTANT (no cookies needed)
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # -----------------------------
 # Models
