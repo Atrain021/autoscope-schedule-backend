@@ -18,6 +18,154 @@ from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 from typing import Optional, Dict, List
 
+import re
+import json
+import base64
+from typing import Dict, Optional
+
+# -----------------------------
+# Helper for Drawing Type - need to expand for all sets
+# -----------------------------
+
+ARCH_SHEET_TYPES = [
+    "COVER_SHEET",
+    "SHEET_INDEX_GENERAL_NOTES",
+    "CODE_LIFE_SAFETY",
+    "SITE_PLAN",
+    "FLOOR_PLAN",
+    "ENLARGED_PLAN",
+    "REFLECTED_CEILING_PLAN",
+    "ROOF_PLAN",
+    "LIFE_SAFETY_EGRESS_PLAN",
+    "ELEVATIONS",
+    "SECTIONS",
+    "DETAILS",
+    "WALL_TYPES_ASSEMBLIES",
+    "DOOR_WINDOW_SCHEDULES",
+    "ROOM_FINISH_SCHEDULES",
+    "OTHER_SCHEDULES",
+    "SPECIFICATIONS_NOTES",
+    "OTHER",
+]
+
+ARCH_ALLOWED_SET = set(ARCH_SHEET_TYPES)
+
+def _clean_json_text(text: str) -> str:
+    """Remove ```json fences if present."""
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = re.sub(r'^```[a-zA-Z]*\n', '', t)
+        t = re.sub(r'\n```$', '', t)
+        t = t.strip()
+    return t
+
+
+def _normalize_arch_type(value: str) -> str:
+    v = (value or "").strip().upper()
+    v = v.replace(" ", "_").replace("-", "_")
+    # common aliases
+    aliases = {
+        "FINISH_SCHEDULE": "ROOM_FINISH_SCHEDULES",
+        "FINISH_SCHEDULES": "ROOM_FINISH_SCHEDULES",
+        "ROOM_FINISH_SCHEDULE": "ROOM_FINISH_SCHEDULES",
+        "RFS": "ROOM_FINISH_SCHEDULES",
+        "DOOR_SCHEDULE": "DOOR_WINDOW_SCHEDULES",
+        "WINDOW_SCHEDULE": "DOOR_WINDOW_SCHEDULES",
+        "DOOR_WINDOW_SCHEDULE": "DOOR_WINDOW_SCHEDULES",
+        "GENERAL_NOTES": "SHEET_INDEX_GENERAL_NOTES",
+        "SHEET_INDEX": "SHEET_INDEX_GENERAL_NOTES",
+        "CODE": "CODE_LIFE_SAFETY",
+        "LIFE_SAFETY": "CODE_LIFE_SAFETY",
+        "EGRESS": "LIFE_SAFETY_EGRESS_PLAN",
+        "PLAN": "FLOOR_PLAN",
+        "DETAIL": "DETAILS",
+        "SECTION": "SECTIONS",
+        "ELEVATION": "ELEVATIONS",
+        "WALL_TYPES": "WALL_TYPES_ASSEMBLIES",
+        "ASSEMBLY_TYPES": "WALL_TYPES_ASSEMBLIES",
+    }
+    if v in aliases:
+        v = aliases[v]
+    return v if v in ARCH_ALLOWED_SET else "OTHER"
+
+
+def _override_by_title(sheet_title: str, sheet_id: str, base_type: str) -> str:
+    """
+    Deterministic overrides based on sheet title / id.
+    This is where we eliminate obvious mislabels (egress plans, schedules, etc.).
+    """
+    title = (sheet_title or "").strip().upper()
+    sid = (sheet_id or "").strip().upper()
+
+    # If title is blank, keep base_type
+    if not title and not sid:
+        return base_type
+
+    # Hard keyword buckets (highest confidence)
+    if any(k in title for k in ["COVER SHEET"]):
+        return "COVER_SHEET"
+
+    if any(k in title for k in ["SHEET INDEX", "GENERAL NOTES", "ABBREVIATIONS", "LEGEND"]):
+        return "SHEET_INDEX_GENERAL_NOTES"
+
+    # Life safety / egress plans
+    if any(k in title for k in ["EGRESS", "EXIT", "LIFE SAFETY", "LIFE-SAFETY", "EVACUATION"]):
+        return "LIFE_SAFETY_EGRESS_PLAN"
+
+    # Code / analysis pages (not necessarily “plans”)
+    if any(k in title for k in ["CODE", "OCCUPANCY", "UNIT MIX", "FIRE RATING", "ACCESSIBILITY", "ADA", "IBC", "NFPA"]):
+        return "CODE_LIFE_SAFETY"
+
+    # Finish schedules
+    if any(k in title for k in ["FINISH SCHEDULE", "ROOM FINISH", "FINISH LEGEND", "FINISH PLAN LEGEND"]):
+        return "ROOM_FINISH_SCHEDULES"
+
+    # Door/window schedules
+    if any(k in title for k in ["DOOR SCHEDULE", "WINDOW SCHEDULE", "STOREFRONT SCHEDULE", "FRAME SCHEDULE"]):
+        return "DOOR_WINDOW_SCHEDULES"
+
+    # RCP
+    if any(k in title for k in ["REFLECTED CEILING", "RCP", "CEILING PLAN"]):
+        return "REFLECTED_CEILING_PLAN"
+
+    # Roof plan
+    if any(k in title for k in ["ROOF PLAN", "PENTHOUSE ROOF", "ROOF"]):
+        # avoid misfiring on "roof details"
+        if "DETAIL" not in title and "SECTION" not in title:
+            return "ROOF_PLAN"
+
+    # Site plan
+    if any(k in title for k in ["SITE PLAN", "GRADING", "SITE", "UTILITY PLAN", "EROSION", "SEDIMENT"]):
+        return "SITE_PLAN"
+
+    # Elevations / sections / details
+    if "ELEVATION" in title or title.startswith("ELEVATIONS"):
+        return "ELEVATIONS"
+
+    if "SECTION" in title or title.startswith("SECTIONS"):
+        return "SECTIONS"
+
+    if "DETAIL" in title or title.startswith("DETAILS"):
+        return "DETAILS"
+
+    # Wall types / assemblies
+    if any(k in title for k in ["WALL TYPE", "PARTITION TYPE", "ASSEMBLY", "TYPICAL WALL"]):
+        return "WALL_TYPES_ASSEMBLIES"
+
+    # Enlarged plans (toilet rooms, kitchens, etc.)
+    if "ENLARGED" in title or any(k in title for k in ["TOILET ROOM PLAN", "KITCHEN PLAN", "BATHROOM PLAN"]):
+        return "ENLARGED_PLAN"
+
+    # If the model said "FLOOR_PLAN" but title screams it's not, downgrade:
+    if base_type == "FLOOR_PLAN":
+        if any(k in title for k in ["SITE", "CODE", "SCHEDULE", "DETAIL", "SECTION", "ELEVATION", "NOTES", "INDEX"]):
+            # pick the closest based on title; otherwise OTHER
+            # (most are handled above, this is just safety)
+            return "OTHER"
+
+    return base_type
+
+
 # -----------------------------
 # Configuration
 # -----------------------------
@@ -407,32 +555,35 @@ def _clean_json_text(text: str) -> str:
 
 def _classify_single_page(image_bytes: bytes) -> Dict[str, str]:
     """
-    Classify a single PDF page image as FINISH_SCHEDULE / FLOOR_PLAN / OTHER.
+    Classify a single PDF page image into an Architectural sheet type.
     Also attempt to read sheet_identifier and sheet_title if visible.
+    Then apply deterministic overrides based on title/id.
     """
     base64_image = base64.b64encode(image_bytes).decode("utf-8")
 
-    prompt = """You are looking at ONE page from a construction drawing PDF.
+    type_list = ", ".join(ARCH_SHEET_TYPES)
 
-Classify the page visually into exactly one of:
-- FINISH_SCHEDULE (table/schedule with rows/columns, finish tags like AC-01/PT-02/etc)
-- FLOOR_PLAN (plan view with rooms/walls/dimensions/tags)
-- OTHER (everything else)
+    prompt = f"""You are looking at ONE page from a construction drawing PDF (Architectural set).
 
-Also extract if visible:
-- sheet_identifier (ex: I-601, A-201, ID-411, etc.)
-- sheet_title (ex: "LEVEL 1 FLOOR PLAN", "FINISH SCHEDULE", etc.)
+Your job:
+1) Visually classify this page into exactly ONE of these types:
+{type_list}
+
+2) If visible, extract:
+- sheet_identifier (examples: A101, A0.01, AS-201, etc.)
+- sheet_title (examples: "LEVEL 2 FLOOR PLAN", "DOOR SCHEDULE", etc.)
 
 Return ONLY valid JSON in exactly this format:
-{
-  "classification": "FINISH_SCHEDULE",
-  "sheet_identifier": "I-601",
-  "sheet_title": "FINISH SCHEDULE"
-}
+{{
+  "classification": "FLOOR_PLAN",
+  "sheet_identifier": "A101",
+  "sheet_title": "LEVEL 1 FLOOR PLAN"
+}}
 
 Rules:
-- If sheet_identifier/title are not clearly visible, return "" for them.
-- No markdown. No extra text. JSON only.
+- Do NOT output markdown.
+- If sheet_identifier or sheet_title are not clearly visible, return "" for them.
+- Choose the most specific type available (e.g., if it’s an EGRESS plan, choose LIFE_SAFETY_EGRESS_PLAN, not FLOOR_PLAN).
 """
 
     resp = client.chat.completions.create(
@@ -456,20 +607,22 @@ Rules:
         temperature=0.0,
     )
 
-    raw = resp.choices[0].message.content.strip()
+    raw = (resp.choices[0].message.content or "").strip()
     cleaned = _clean_json_text(raw)
     data = json.loads(cleaned)
 
-    # Hard normalize classification
-    cls = (data.get("classification") or "").strip().upper()
-    if cls not in {"FINISH_SCHEDULE", "FLOOR_PLAN", "OTHER"}:
-        cls = "OTHER"
+    sheet_id = (data.get("sheet_identifier") or "").strip()
+    sheet_title = (data.get("sheet_title") or "").strip()
+
+    base_type = _normalize_arch_type(data.get("classification") or "OTHER")
+    final_type = _override_by_title(sheet_title, sheet_id, base_type)
 
     return {
-        "classification": cls,
-        "sheet_identifier": (data.get("sheet_identifier") or "").strip(),
-        "sheet_title": (data.get("sheet_title") or "").strip(),
+        "classification": final_type,
+        "sheet_identifier": sheet_id,
+        "sheet_title": sheet_title,
     }
+
 
 
 @app.post("/classify-pdf")
