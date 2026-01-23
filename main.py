@@ -2,6 +2,7 @@
 
 import os
 import re
+import gc
 import json
 import uuid
 import base64
