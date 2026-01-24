@@ -8,11 +8,12 @@ import uuid
 import base64
 from typing import Dict, List, Optional
 from pathlib import Path
+from pydantic import BaseModel, Field
+
 
 import fitz  # PyMuPDF
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
-from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 
 from openai import OpenAI
@@ -182,6 +183,65 @@ app = FastAPI(
     description="AI-powered construction schedule extraction",
     version="2.0.0"
 )
+
+class PageIndexPage(BaseModel):
+    page_number: int
+    sheet_identifier: Optional[str] = None
+    sheet_title: Optional[str] = None
+    classification: Optional[str] = None  # current: FINISH_SCHEDULE / FLOOR_PLAN / OTHER
+
+
+class PageIndexPayload(BaseModel):
+    filename: str
+    pdf_url: Optional[str] = None
+    taxonomy_version: str = "v1-coarse"
+    pages: List[PageIndexPage] = Field(default_factory=list)
+
+
+def _page_index_qc_flags(pages: List[PageIndexPage]) -> Dict[str, Any]:
+    # Basic QC flags that help you quickly spot issues.
+    missing_sheet_id_pages = [p.page_number for p in pages if not (p.sheet_identifier and p.sheet_identifier.strip())]
+    low_info_title_pages = [p.page_number for p in pages if not (p.sheet_title and p.sheet_title.strip())]
+
+    # Duplicate sheet IDs (common when OCR/classifier mistakes happen)
+    sheet_map: Dict[str, List[int]] = {}
+    for p in pages:
+        sid = (p.sheet_identifier or "").strip()
+        if not sid:
+            continue
+        sheet_map.setdefault(sid, []).append(p.page_number)
+    duplicates = {sid: nums for sid, nums in sheet_map.items() if len(nums) > 1}
+
+    # Classification counts
+    counts: Dict[str, int] = {}
+    for p in pages:
+        c = (p.classification or "UNKNOWN").strip()
+        counts[c] = counts.get(c, 0) + 1
+
+    return {
+        "page_count": len(pages),
+        "classification_counts": counts,
+        "missing_sheet_identifier_pages": missing_sheet_id_pages[:50],  # cap so response doesn't blow up
+        "missing_sheet_title_pages": low_info_title_pages[:50],
+        "duplicate_sheet_identifiers": duplicates,  # may be large but usually small
+    }
+
+@app.post("/page-index/qc-summary")
+def page_index_qc_summary(payload: PageIndexPayload) -> Dict[str, Any]:
+    flags = _page_index_qc_flags(payload.pages)
+
+    # A simple "success criteria" you can use in UI:
+    # - no missing sheet IDs
+    # - page_count matches expected
+    ok = (len(flags["missing_sheet_identifier_pages"]) == 0)
+
+    return {
+        "ok": ok,
+        "filename": payload.filename,
+        "taxonomy_version": payload.taxonomy_version,
+        "stats": flags,
+    }
+
 
 from fastapi import Request
 from fastapi.responses import Response
