@@ -639,13 +639,24 @@ async def classify_pdf(request: ClassifyPdfRequest):
         doc = fitz.open(str(filepath))
         total_pages = len(doc)
 
-        # Convert user range (1-based) -> python range (0-based)
         start = max(1, int(request.start_page))
+
+        # ✅ NEW: if Base44 asks beyond the last page, return empty list (don't error)
+        if start > total_pages:
+            doc.close()
+            return JSONResponse({
+                "filename": request.filename,
+                "total_pages": total_pages,
+                "pages": []
+            })
+
         end = int(request.end_page) if request.end_page else total_pages
         end = min(end, total_pages)
 
         if start > end:
+            doc.close()
             raise HTTPException(status_code=422, detail="start_page must be <= end_page")
+
 
         extractor = ScheduleExtractor()
         pages_out = []
