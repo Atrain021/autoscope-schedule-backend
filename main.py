@@ -843,6 +843,23 @@ def _parse_numbered_notes(text: str) -> List[Dict[str, Any]]:
 
     return notes
 
+def _dedupe_notes(notes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Remove duplicates caused by region overlap or repeated parsing.
+    Dedupes by (note_id + text).
+    """
+    seen = set()
+    out: List[Dict[str, Any]] = []
+    for n in notes:
+        note_id = n.get("note_id")
+        txt = (n.get("text") or "").strip()
+        key = (note_id, txt)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(n)
+    return out
+
 
 def _cluster_columns(words: List[Dict[str, Any]], page_width: float) -> List[List[Dict[str, Any]]]:
     """
@@ -1025,12 +1042,11 @@ def _extract_two_column_texts_by_crop(pdf_page) -> List[str]:
     gutter = max(12.0, w * 0.02)  # 2% width or 12pt
     mid = w / 2.0
 
-    # Keep consistent with your bbox logic (drop title block)
-    top_crop = 0.0
-    bottom_crop = h * 0.88
+    # IMPORTANT: do NOT crop top/bottom here.
+    # The caller (extract-notes-v1) already crops the page using bbox.
+    left = pdf_page.crop((0, 0, mid - gutter, h))
+    right = pdf_page.crop((mid + gutter, 0, w, h))
 
-    left = pdf_page.crop((0, top_crop, mid - gutter, bottom_crop))
-    right = pdf_page.crop((mid + gutter, top_crop, w, bottom_crop))
 
     def words_to_text(p) -> str:
         words = p.extract_words(
@@ -1724,34 +1740,39 @@ async def extract_notes_v1(request: ExtractNotesV1Request):
 
                 # Prefer column extraction from the chosen regions if we have them,
                 # otherwise use the bbox-cropped page.
-                if chosen_regions:
-                    for rb in chosen_regions:
-                        cropped_bbox = page.crop(bbox)
-                        col_texts = _extract_two_column_texts_by_crop(cropped_bbox)
-                        for col_text in col_texts:
-                            page_notes.extend(_parse_numbered_notes(col_text))
+                # Always parse from ONE stable crop: the bbox.
+                # (This prevents double-parsing and region overlap duplicates.)
+                cropped_bbox = page.crop(bbox)
 
+                # 1) Try your general N-column method first (works for 1,2,3,4,5 columns)
+                col_texts = _extract_column_texts(cropped_bbox)
 
+                # 2) If it looks like a 2-column page, compare against the hard 2-column crop method
+                if len(col_texts) == 2:
+                    def starters_count(t: str) -> int:
+                        return len(re.findall(r"(?m)^\s*\d{1,4}\s*[\)\.\:]\s+", t or ""))
 
-                        # Fallback if crop method finds nothing
-                        if not col_texts:
-                            fallback_text = _extract_text_reading_order_auto_columns(cropped_region) or (cropped_region.extract_text() or "")
-                            col_texts = [fallback_text] if fallback_text else []
+                    clustered_score = starters_count(col_texts[0]) + starters_count(col_texts[1])
 
-                        for col_text in col_texts:
-                            page_notes.extend(_parse_numbered_notes(col_text))
-                else:
-                    cropped_bbox = page.crop(bbox)
+                    cropped_2col = _extract_two_column_texts_by_crop(cropped_bbox)
+                    crop_score = sum(starters_count(t) for t in cropped_2col)
 
-                    # ✅ HARD SPLIT into left/right halves (prevents interleaving)
-                    col_texts = _extract_two_column_texts_by_crop(cropped_bbox)
+                    # pick whichever gives more numbered-note starters
+                    if crop_score > clustered_score:
+                        col_texts = cropped_2col
 
-                    if not col_texts:
-                        fallback_text = _extract_text_reading_order_auto_columns(cropped_bbox) or (cropped_bbox.extract_text() or "")
-                        col_texts = [fallback_text] if fallback_text else []
+                # 3) Fallback: if nothing came back, use reading-order text
+                if not col_texts:
+                    fallback_text = _extract_text_reading_order_auto_columns(cropped_bbox) or (cropped_bbox.extract_text() or "")
+                    col_texts = [fallback_text] if fallback_text else []
 
-                    for col_text in col_texts:
-                        page_notes.extend(_parse_numbered_notes(col_text))
+                # 4) Parse notes per column
+                for col_text in col_texts:
+                    page_notes.extend(_parse_numbered_notes(col_text))
+
+                # 5) Deduplicate (fixes your “same notes twice” problem)
+                page_notes = _dedupe_notes(page_notes)
+
 
 
 
