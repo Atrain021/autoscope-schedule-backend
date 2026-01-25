@@ -247,7 +247,7 @@ class PageIndexPage(BaseModel):
     sheet_identifier: Optional[str] = None
     sheet_title: Optional[str] = None
     classification: Optional[str] = None  # current: FINISH_SCHEDULE / FLOOR_PLAN / OTHER
-
+    discipline: Optional[str] = None   # ✅ ADD THIS
 
 class PageIndexPayload(BaseModel):
     filename: str
