@@ -6,7 +6,7 @@ import gc
 import json
 import uuid
 import base64
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from pathlib import Path
 from pydantic import BaseModel, Field
 
@@ -17,12 +17,10 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from openai import OpenAI
-from typing import Optional, Dict, List
 
 import re
 import json
 import base64
-from typing import Dict, Optional
 
 # -----------------------------
 # Helper for Drawing Type - need to expand for all sets
