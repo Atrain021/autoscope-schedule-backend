@@ -602,8 +602,17 @@ def infer_discipline_from_sheet_id(sheet_id: str | None) -> str:
         "–": "-", "—": "-", "-": "-", "−": "-", "﹣": "-", "－": "-"
     }))
 
-    m = re.search(r"\b([A-Z]{1,3})\s*-\s*\d+", raw)
-    prefix = m.group(1) if m else raw[:2].strip()
+    # Match either "A-101" OR "A101" OR "FP-101" OR "FP101"
+    m = re.search(r"\b([A-Z]{1,3})\s*-\s*(\d+)\b|\b([A-Z]{1,3})(\d+)\b", raw)
+
+    if m:
+        # group(1) is prefix when dash-form matches; group(3) is prefix when no-dash matches
+        prefix = (m.group(1) or m.group(3) or "").strip()
+    else:
+        # fallback: just take first 1–3 letters at start
+        m2 = re.match(r"^([A-Z]{1,3})", raw)
+        prefix = m2.group(1) if m2 else ""
+
 
     if prefix == "A":
         return "ARCHITECTURAL"
