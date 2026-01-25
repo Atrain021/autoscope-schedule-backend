@@ -692,7 +692,7 @@ def _page_index_qc_flags(pages: List[PageIndexPage]) -> Dict[str, Any]:
     # Classification counts
     counts: Dict[str, int] = {}
     for p in pages:
-        c = (p.classification or "UNKNOWN").strip()
+        c = (p.drawing_type or p.classification or "UNKNOWN").strip()
         counts[c] = counts.get(c, 0) + 1
 
     return {
@@ -817,6 +817,136 @@ def _parse_numbered_notes(text: str) -> List[Dict[str, Any]]:
     current_key = None
     current_parts: List[str] = []
 
+def _cluster_columns(words: List[Dict[str, Any]], page_width: float) -> List[List[Dict[str, Any]]]:
+    """
+    Cluster words into N columns based on x0 positions.
+    Uses a simple gap-based heuristic on sorted x0 values.
+
+    Returns: list of columns, each a list of words
+    """
+    if not words:
+        return []
+
+    # Sort words by x0
+    words_sorted = sorted(words, key=lambda w: w["x0"])
+    x0s = [w["x0"] for w in words_sorted]
+
+    # Compute gaps between successive x0s
+    gaps = [x0s[i+1] - x0s[i] for i in range(len(x0s) - 1)]
+    if not gaps:
+        return [words]
+
+    # Heuristic threshold: treat big gaps as column breaks.
+    # Dynamic threshold based on page width (works across different sheet sizes)
+    # Typical gutters are large compared to within-column x spacing.
+    gap_threshold = max(40.0, page_width * 0.06)  # 6% width or 40pts, whichever is larger
+
+    # Identify breakpoints where gap is large
+    break_indices = [i for i, g in enumerate(gaps) if g >= gap_threshold]
+
+    # If no meaningful gaps, assume single column
+    if not break_indices:
+        return [words]
+
+    # Break into x-ranges (segments) based on breakpoints
+    segments = []
+    start = 0
+    for bi in break_indices:
+        end = bi + 1
+        seg_words = words_sorted[start:end]
+        if seg_words:
+            segments.append(seg_words)
+        start = end
+    tail = words_sorted[start:]
+    if tail:
+        segments.append(tail)
+
+    # Now assign original words into these segments by x0 range
+    # (segments already contain the words)
+    # But segments may include noise (tiny outliers). We'll keep it simple for v1.
+
+    return segments
+
+
+def _words_to_lines(col_words: List[Dict[str, Any]]) -> List[str]:
+    """
+    Convert a list of words into lines using y grouping.
+    """
+    if not col_words:
+        return []
+
+    # Sort by top then x0
+    col_words = sorted(col_words, key=lambda w: (round(w["top"], 1), w["x0"]))
+
+    lines = []
+    current_top = None
+    current_line = []
+
+    for w in col_words:
+        t = round(w["top"], 1)
+        if current_top is None:
+            current_top = t
+
+        # New line when y jumps
+        if abs(t - current_top) > 3:
+            if current_line:
+                lines.append(" ".join(current_line))
+            current_line = [w["text"]]
+            current_top = t
+        else:
+            current_line.append(w["text"])
+
+    if current_line:
+        lines.append(" ".join(current_line))
+
+    return lines
+
+
+def _extract_text_reading_order_auto_columns(pdf_page) -> str:
+    """
+    Robust reading-order reconstruction for notes pages with 1..N columns.
+
+    Steps:
+      1) extract_words (x0/top)
+      2) cluster into columns by x gaps
+      3) sort columns left->right
+      4) within each column, build lines top->bottom
+      5) join columns sequentially (left to right)
+    """
+    words = pdf_page.extract_words(
+        x_tolerance=2,
+        y_tolerance=2,
+        keep_blank_chars=False,
+        use_text_flow=False,
+    )
+    if not words:
+        return ""
+
+    page_width = float(getattr(pdf_page, "width", 0) or 0)
+    if page_width <= 0:
+        page_width = max(w["x1"] for w in words)
+
+    columns = _cluster_columns(words, page_width)
+
+    # Prevent crazy over-splitting (title blocks / stamps)
+    if len(columns) > 6:
+        # fall back to single-column reading order (top then x) rather than garbage
+        columns = [words]
+
+
+    # Sort columns left->right by their min x0
+    columns = sorted(columns, key=lambda col: min(w["x0"] for w in col))
+
+    all_lines: List[str] = []
+    for col in columns:
+        col_lines = _words_to_lines(col)
+        all_lines.extend(col_lines)
+        all_lines.append("")  # blank line between columns
+
+    return "\n".join(all_lines).strip()
+
+
+
     def flush():
         nonlocal current_key, current_parts
         if current_key and current_parts:
@@ -841,6 +971,14 @@ def _parse_numbered_notes(text: str) -> List[Dict[str, Any]]:
 
     flush()
     return notes
+
+def _looks_like_numbered_notes_page(text: str) -> bool:
+    t = (text or "").upper()
+    if "GENERAL NOTES" in t or "NOTES" in t:
+        return True
+    # If it has multiple numbered note starters, it’s probably a notes list
+    starters = re.findall(r"(?m)^\s*\d{1,3}\s*[\)\.\:]\s+", text or "")
+    return len(starters) >= 5
 
 
 # -----------------------------
@@ -1201,7 +1339,12 @@ async def extract_notes_v1(request: ExtractNotesV1Request):
                 if idx < 0 or idx >= total_pages:
                     continue
 
-                text = pdf.pages[idx].extract_text() or ""
+                page = pdf.pages[idx]
+                text = _extract_text_reading_order_auto_columns(page) or ""
+                if not text.strip():
+                    text = page.extract_text() or ""
+
+
                 parsed = _parse_numbered_notes(text)
 
                 if parsed:
@@ -1213,14 +1356,17 @@ async def extract_notes_v1(request: ExtractNotesV1Request):
                             "parse_method": "numbered_notes"
                         })
                 else:
-                    cleaned = " ".join(text.strip().split())
-                    if cleaned:
-                        note_items.append({
-                            "source_page_number": pn,
-                            "note_id": None,
-                            "text": cleaned[:4000],
-                            "parse_method": "fulltext_snippet"
-                        })
+                    # ✅ Only fallback to snippet if it actually looks like a notes page
+                    if _looks_like_numbered_notes_page(text):
+                        cleaned = " ".join(text.strip().split())
+                        if cleaned:
+                            note_items.append({
+                                "source_page_number": pn,
+                                "note_id": None,
+                                "text": cleaned[:2000],   # reduce to 2000 to avoid junk floods
+                                "parse_method": "fulltext_snippet"
+                            })
+
 
         return JSONResponse({
             "ok": True,
