@@ -178,7 +178,16 @@ def _infer_discipline_from_sheet_id(sheet_id: str | None) -> str:
         return "Unknown"
 
     # Normalize different dash characters to a normal hyphen
-    raw = raw.replace("–", "-").replace("—", "-")
+    # Normalize many dash/hyphen variants to standard hyphen
+    raw = raw.translate(str.maketrans({
+        "–": "-",  # en-dash
+        "—": "-",  # em-dash
+        "-": "-",  # non-breaking hyphen (U+2011)
+        "−": "-",  # minus sign (U+2212)
+        "﹣": "-",  # small hyphen-minus
+        "－": "-",  # fullwidth hyphen-minus
+    }))
+
 
     # Extract the leading sheet prefix token.
     # Examples this catches:
