@@ -1039,7 +1039,7 @@ def _extract_two_column_texts_by_crop(pdf_page) -> List[str]:
         t = pdf_page.extract_text() or ""
         return [t] if t else []
 
-    gutter = max(12.0, w * 0.02)  # 2% width or 12pt
+    gutter = max(24.0, w * 0.04) # 2% width or 12pt
     mid = w / 2.0
 
     # IMPORTANT: do NOT crop top/bottom here.
