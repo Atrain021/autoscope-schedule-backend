@@ -981,6 +981,282 @@ def _looks_like_numbered_notes_page(text: str) -> bool:
     starters = re.findall(r"(?m)^\s*\d{1,3}\s*[\)\.\:]\s+", text or "")
     return len(starters) >= 5
 
+def _get_notes_content_bbox(pdf_page):
+    """
+    Return a bounding box (x0, top, x1, bottom) that excludes
+    common junk areas like title blocks/footers and side keyplans.
+    Coordinates are in PDF points. pdfplumber uses (x0, top, x1, bottom).
+    """
+    w = float(pdf_page.width)
+    h = float(pdf_page.height)
+
+    # Conservative defaults that work on most sheets:
+    # - remove bottom 12% (title block / footer)
+    # - remove right 12% (keyplan/index side strip) ONLY if you want
+    x0 = 0
+    top = 0
+    x1 = w
+    bottom = h * 0.88  # keep top 88%
+
+    # OPTIONAL: if your notes sheets often have a keyplan strip on the far right,
+    # uncomment this:
+    # x1 = w * 0.88
+
+    return (x0, top, x1, bottom)
+
+def _histogram_density(words: List[Dict[str, Any]], axis: str, bins: int, min_v: float, max_v: float) -> List[int]:
+    """
+    Build a simple count histogram for word positions along an axis ('x' uses x0/x1 mid, 'y' uses top/bottom mid).
+    """
+    hist = [0] * bins
+    if not words:
+        return hist
+
+    span = max(max_v - min_v, 1e-6)
+    for w in words:
+        if axis == "x":
+            v = (float(w["x0"]) + float(w["x1"])) / 2.0
+        else:
+            v = (float(w["top"]) + float(w["bottom"])) / 2.0
+
+        idx = int(((v - min_v) / span) * bins)
+        if idx < 0:
+            idx = 0
+        if idx >= bins:
+            idx = bins - 1
+        hist[idx] += 1
+
+    return hist
+
+
+def _find_best_valley_cut(hist: List[int], cut_range: tuple[float, float] = (0.30, 0.70)) -> Optional[int]:
+    """
+    Choose a cut index in the histogram where density is low (a valley),
+    but only within the central portion (default 30%..70%) to avoid margins.
+    Returns bin index or None.
+    """
+    if not hist or len(hist) < 10:
+        return None
+
+    n = len(hist)
+    lo = int(n * cut_range[0])
+    hi = int(n * cut_range[1])
+    if hi <= lo + 2:
+        return None
+
+    window = hist[lo:hi]
+    if not window:
+        return None
+
+    # Pick the minimum density bin. If many, prefer the one closest to center.
+    min_val = min(window)
+    candidates = [i + lo for i, v in enumerate(window) if v == min_val]
+    if not candidates:
+        return None
+
+    center = n / 2.0
+    candidates.sort(key=lambda i: abs(i - center))
+    return candidates[0]
+
+
+def _split_bbox_vertical(bbox: tuple[float, float, float, float], x_cut: float, gap: float = 6.0):
+    """
+    Split bbox into left/right at x_cut. gap makes a small gutter.
+    """
+    x0, top, x1, bottom = bbox
+    left = (x0, top, max(x0, x_cut - gap), bottom)
+    right = (min(x1, x_cut + gap), top, x1, bottom)
+    return left, right
+
+
+def _split_bbox_horizontal(bbox: tuple[float, float, float, float], y_cut: float, gap: float = 6.0):
+    """
+    Split bbox into top/bottom at y_cut. gap makes a small gutter.
+    """
+    x0, top, x1, bottom = bbox
+    upper = (x0, top, x1, max(top, y_cut - gap))
+    lower = (x0, min(bottom, y_cut + gap), x1, bottom)
+    return upper, lower
+
+
+def _notes_region_score(text: str) -> float:
+    """
+    Heuristic score: higher means more likely to be a notes block.
+    Boosts numbered-list starts; penalizes sheet-index style lists.
+    """
+    t = (text or "")
+    tu = t.upper()
+
+    # Count numbered note starters at line starts: "1.", "2)", "3:"
+    starters = re.findall(r"(?m)^\s*\d{1,3}\s*[\)\.\:]\s+", t)
+    starter_count = len(starters)
+
+    # Penalize sheet index / drawing list vibe: lots of tokens like A101, E-601, M301
+    sheet_ids = re.findall(r"\b[A-Z]{1,3}\s*[-]?\s*\d{2,4}\b", tu)
+    sheet_id_count = len(sheet_ids)
+
+    score = 0.0
+    score += starter_count * 3.0
+
+    if "GENERAL NOTES" in tu:
+        score += 10.0
+    elif "NOTES" in tu:
+        score += 4.0
+
+    # Penalize if it looks like a sheet index region (lots of sheet ids, few numbered starters)
+    if sheet_id_count >= 12 and starter_count <= 3:
+        score -= 12.0
+    else:
+        score -= min(sheet_id_count, 30) * 0.2
+
+    # If it's extremely short, likely not useful
+    if len(t.strip()) < 120:
+        score -= 3.0
+
+    return score
+
+
+def regionize_page_v1(pdf_page, base_bbox: Optional[tuple[float, float, float, float]] = None,
+                      max_regions: int = 6, min_words_per_region: int = 35) -> List[tuple[float, float, float, float]]:
+    """
+    Regionizer v1:
+    - Start from base_bbox (or full page).
+    - Extract words in that bbox.
+    - Find a strong vertical or horizontal whitespace valley near the center.
+    - Recursively split up to max_regions, ensuring each region has enough words.
+
+    Returns list of bboxes in ORIGINAL page coordinates.
+    """
+    # Start bbox
+    if base_bbox is None:
+        base_bbox = (0.0, 0.0, float(pdf_page.width), float(pdf_page.height))
+
+    regions = [base_bbox]
+
+    def word_count_in_bbox(b: tuple[float, float, float, float]) -> int:
+        try:
+            cropped = pdf_page.crop(b)
+            ws = cropped.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=False, use_text_flow=False)
+            return len(ws or [])
+        except Exception:
+            return 0
+
+    # Simple best-first splitting
+    while True:
+        if len(regions) >= max_regions:
+            break
+
+        # Pick region with the most words to attempt splitting
+        regions_with_counts = [(b, word_count_in_bbox(b)) for b in regions]
+        regions_with_counts.sort(key=lambda x: x[1], reverse=True)
+
+        # If biggest region is too small, stop
+        b0, c0 = regions_with_counts[0]
+        if c0 < (min_words_per_region * 2):
+            break
+
+        # Try split this region
+        cropped0 = pdf_page.crop(b0)
+        words = cropped0.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=False, use_text_flow=False) or []
+        if len(words) < (min_words_per_region * 2):
+            break
+
+        # Compute histograms in cropped coordinate space
+        x0, top0, x1, bot0 = b0
+        w_span = max(x1 - x0, 1e-6)
+        h_span = max(bot0 - top0, 1e-6)
+
+        # Use midpoints along axes
+        x_hist = _histogram_density(words, axis="x", bins=80, min_v=x0, max_v=x1)
+        y_hist = _histogram_density(words, axis="y", bins=80, min_v=top0, max_v=bot0)
+
+        x_cut_bin = _find_best_valley_cut(x_hist, (0.30, 0.70))
+        y_cut_bin = _find_best_valley_cut(y_hist, (0.30, 0.70))
+
+        # Turn bin into coordinate
+        x_cut = None
+        y_cut = None
+        if x_cut_bin is not None:
+            x_cut = x0 + (x_cut_bin / 80.0) * w_span
+        if y_cut_bin is not None:
+            y_cut = top0 + (y_cut_bin / 80.0) * h_span
+
+        # Decide which split is "better" by checking word balance
+        best_split = None  # ("v" or "h", bA, bB)
+        best_balance = 0.0
+
+        if x_cut is not None:
+            left, right = _split_bbox_vertical(b0, x_cut, gap=8.0)
+            cL = word_count_in_bbox(left)
+            cR = word_count_in_bbox(right)
+            if min(cL, cR) >= min_words_per_region:
+                balance = min(cL, cR) / max(cL, cR)
+                if balance > best_balance:
+                    best_balance = balance
+                    best_split = ("v", left, right)
+
+        if y_cut is not None:
+            upper, lower = _split_bbox_horizontal(b0, y_cut, gap=8.0)
+            cU = word_count_in_bbox(upper)
+            cD = word_count_in_bbox(lower)
+            if min(cU, cD) >= min_words_per_region:
+                balance = min(cU, cD) / max(cU, cD)
+                if balance > best_balance:
+                    best_balance = balance
+                    best_split = ("h", upper, lower)
+
+        # If no split met minimum criteria, stop splitting
+        if not best_split:
+            break
+
+        # Apply split: replace b0 in regions with the two new bboxes
+        _, bA, bB = best_split
+        new_regions = []
+        for b in regions:
+            if b == b0:
+                new_regions.extend([bA, bB])
+            else:
+                new_regions.append(b)
+        regions = new_regions
+
+    return regions
+
+
+def _extract_best_notes_text_from_page(pdf_page, base_bbox: tuple[float, float, float, float]) -> tuple[str, List[tuple]]:
+    """
+    Uses regionizer + scoring to select best region(s) for notes extraction.
+    Returns (combined_text, chosen_region_bboxes).
+    """
+    region_bboxes = regionize_page_v1(pdf_page, base_bbox=base_bbox, max_regions=6, min_words_per_region=35)
+
+    scored_regions = []
+    for rb in region_bboxes:
+        try:
+            cropped = pdf_page.crop(rb)
+            text = _extract_text_reading_order_auto_columns(cropped) or ""
+            score = _notes_region_score(text)
+            scored_regions.append((score, rb, text))
+        except Exception:
+            continue
+
+    if not scored_regions:
+        return "", []
+
+    scored_regions.sort(key=lambda x: x[0], reverse=True)
+
+    # Keep the best region, and optionally a 2nd if it’s also clearly notes-like
+    best = scored_regions[0]
+    chosen = [best]
+
+    if len(scored_regions) > 1:
+        second = scored_regions[1]
+        # Only include 2nd region if it has real numbered note density too
+        if second[0] >= best[0] * 0.65 and second[0] >= 6.0:
+            chosen.append(second)
+
+    combined = "\n\n".join([c[2] for c in chosen]).strip()
+    return combined, [c[1] for c in chosen]
+
 
 # -----------------------------
 # Core Extraction Logic
@@ -1341,9 +1617,24 @@ async def extract_notes_v1(request: ExtractNotesV1Request):
                     continue
 
                 page = pdf.pages[idx]
-                text = _extract_text_reading_order_auto_columns(page) or ""
+                bbox = _get_notes_content_bbox(page)
+
+                # 1) ✅ Regionize + pick best notes-like region(s)
+                text, chosen_regions = _extract_best_notes_text_from_page(page, base_bbox=bbox)
+
+                # 2) Fallback: try the bbox only (still avoids title block)
                 if not text.strip():
-                    text = _extract_text_reading_order_auto_columns(page) or (page.extract_text() or "")
+                    cropped = page.crop(bbox)
+                    text = _extract_text_reading_order_auto_columns(cropped) or ""
+
+                # 3) Fallback: try full-page reading order
+                if not text.strip():
+                    text = _extract_text_reading_order_auto_columns(page) or ""
+
+                # 4) Last resort: raw pdfplumber text
+                if not text.strip():
+                    text = page.extract_text() or ""
+
 
 
                 parsed = _parse_numbered_notes(text)
@@ -1358,7 +1649,7 @@ async def extract_notes_v1(request: ExtractNotesV1Request):
                         })
                 else:
                     # ✅ Only fallback to snippet if it actually looks like a notes page
-                    if _looks_like_numbered_notes_page(text):
+                    if _looks_like_numbered_notes_page(text) and _notes_region_score(text) >= 6.0:
                         cleaned = " ".join(text.strip().split())
                         if cleaned:
                             note_items.append({
