@@ -1064,18 +1064,17 @@ def _extract_two_column_texts_by_crop(pdf_page) -> List[str]:
     left = pdf_page.crop((0, 0, mid - gutter, h))
     right = pdf_page.crop((mid + gutter, 0, w, h))
 
-
     def words_to_text(p) -> str:
-    words = p.extract_words(
-        x_tolerance=2,
-        y_tolerance=2,
-        keep_blank_chars=False,
-        use_text_flow=False,
-    )
-    if not words:
-        return ""
-    lines = words_to_lines_strict(words)  # ✅ CORRECT
-    return "\n".join(lines).strip()
+        words = p.extract_words(
+            x_tolerance=2,
+            y_tolerance=2,
+            keep_blank_chars=False,
+            use_text_flow=False,
+        )
+        if not words:
+            return ""
+        lines = words_to_lines_strict(words)
+        return "\n".join(lines).strip()
 
     left_text = words_to_text(left)
     right_text = words_to_text(right)
