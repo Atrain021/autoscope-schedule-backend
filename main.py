@@ -806,16 +806,43 @@ def _is_notes_page(p: Dict[str, Any]) -> bool:
 
 def _parse_numbered_notes(text: str) -> List[Dict[str, Any]]:
     """
-    Pull notes like:
+    Parse notes like:
       1. text...
       2) text...
       3: text...
     Joins wrapped lines into the note.
+    No nonlocal usage (safer).
     """
     lines = [ln.rstrip() for ln in (text or "").splitlines()]
     notes: List[Dict[str, Any]] = []
-    current_key = None
+
+    current_key: Optional[str] = None
     current_parts: List[str] = []
+
+    key_re = re.compile(r"^\s*(\d{1,4})\s*[\)\.\:]\s+(.*)$")
+
+    for ln in lines:
+        m = key_re.match(ln)
+        if m:
+            if current_key and current_parts:
+                notes.append({
+                    "note_id": current_key,
+                    "text": " ".join(" ".join(current_parts).split())
+                })
+            current_key = m.group(1)
+            current_parts = [m.group(2)]
+        else:
+            if current_key and ln.strip():
+                current_parts.append(ln.strip())
+
+    if current_key and current_parts:
+        notes.append({
+            "note_id": current_key,
+            "text": " ".join(" ".join(current_parts).split())
+        })
+
+    return notes
+
 
 def _cluster_columns(words: List[Dict[str, Any]], page_width: float) -> List[List[Dict[str, Any]]]:
     """
@@ -945,32 +972,6 @@ def _extract_text_reading_order_auto_columns(pdf_page) -> str:
 
     return "\n".join(all_lines).strip()
 
-
-
-    def flush():
-        nonlocal current_key, current_parts
-        if current_key and current_parts:
-            notes.append({
-                "note_id": current_key,
-                "text": " ".join(" ".join(current_parts).split())
-            })
-        current_key = None
-        current_parts = []
-
-    key_re = re.compile(r"^\s*(\d{1,4})\s*[\)\.\:]\s+(.*)$")
-
-    for ln in lines:
-        m = key_re.match(ln)
-        if m:
-            flush()
-            current_key = m.group(1)
-            current_parts.append(m.group(2))
-        else:
-            if current_key and ln.strip():
-                current_parts.append(ln.strip())
-
-    flush()
-    return notes
 
 def _looks_like_numbered_notes_page(text: str) -> bool:
     t = (text or "").upper()
@@ -1342,7 +1343,7 @@ async def extract_notes_v1(request: ExtractNotesV1Request):
                 page = pdf.pages[idx]
                 text = _extract_text_reading_order_auto_columns(page) or ""
                 if not text.strip():
-                    text = page.extract_text() or ""
+                    text = _extract_text_reading_order_auto_columns(page) or (page.extract_text() or "")
 
 
                 parsed = _parse_numbered_notes(text)
