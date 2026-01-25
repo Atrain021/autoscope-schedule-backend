@@ -688,7 +688,7 @@ Your job:
 {type_list}
 
 2) If visible, extract:
-- sheet_identifier (examples: A101, A0.01, AS-201, etc.)
+- sheet_identifier (examples: A101, A0.01, AS-201, I-201, I-411, I-601, ID-201, etc.)
 - sheet_title (examples: "LEVEL 2 FLOOR PLAN", "DOOR SCHEDULE", etc.)
 
 Return ONLY valid JSON in exactly this format:
@@ -714,7 +714,7 @@ Rules:
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": f"data:image/png;base64,{base64_image}",
+                            "url": f"data:image/jpeg;base64,{base64_image}",
                             "detail": "high",
                         },
                     },
@@ -790,6 +790,7 @@ async def classify_pdf(request: ClassifyPdfRequest):
 
 
             page_info = _classify_single_page(image_bytes)
+            print("DEBUG classify:", page_number, page_info)
             sheet_id = page_info.get("sheet_identifier")
             sheet_title = page_info.get("sheet_title")
             classification = page_info.get("classification")
