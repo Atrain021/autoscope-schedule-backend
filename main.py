@@ -22,12 +22,43 @@ import re
 import json
 import base64
 
-# -----------------------------
-# Helper for Drawing Type - need to expand for all sets
-# -----------------------------
 
+# ----------------------------
+# DISCIPLINE + DRAWING TAXONOMY (Phase 1)
+# ----------------------------
 
-ARCH_SHEET_TYPES = [
+DISCIPLINES = [
+    "ARCHITECTURAL",
+    "INTERIOR_DESIGN",
+    "STRUCTURAL",
+    "CIVIL",
+    "MECHANICAL",
+    "ELECTRICAL",
+    "PLUMBING",
+    "FIRE_PROTECTION",
+    "FIRE_ALARM_LOW_VOLTAGE",
+    "LANDSCAPE",
+    "UNKNOWN",
+]
+
+# Shared drawing types (appear in many disciplines)
+COMMON_SHEET_TYPES = [
+    "COVER_SHEET",
+    "SHEET_INDEX",
+    "GENERAL_NOTES",
+    "LEGENDS_SYMBOLS_ABBREVIATIONS",
+    "CODE_LIFE_SAFETY",
+    "DETAILS",
+    "SECTIONS",
+    "ELEVATIONS",
+    "SCHEDULES",
+    "DIAGRAMS",
+    "SPECIFICATIONS_NOTES",
+    "OTHER",
+]
+
+# Architectural / Interior Design types (your existing list, refined)
+ARCH_ID_SHEET_TYPES = [
     "COVER_SHEET",
     "SHEET_INDEX_GENERAL_NOTES",
     "CODE_LIFE_SAFETY",
@@ -43,12 +74,171 @@ ARCH_SHEET_TYPES = [
     "WALL_TYPES_ASSEMBLIES",
     "DOOR_WINDOW_SCHEDULES",
     "ROOM_FINISH_SCHEDULES",
+    "FINISH_LEGENDS_TAG_GLOSSARY",
     "OTHER_SCHEDULES",
     "SPECIFICATIONS_NOTES",
     "OTHER",
 ]
 
-ARCH_ALLOWED_SET = set(ARCH_SHEET_TYPES)
+# Structural types
+STRUCTURAL_SHEET_TYPES = [
+    "COVER_SHEET",
+    "SHEET_INDEX_GENERAL_NOTES",
+    "GENERAL_STRUCTURAL_NOTES",
+    "FOUNDATION_PLAN",
+    "FRAMING_PLAN",
+    "ROOF_FRAMING_PLAN",
+    "SLAB_ON_GRADE_PLAN",
+    "COLUMN_SCHEDULE",
+    "BEAM_SCHEDULE",
+    "STEEL_CONNECTION_DETAILS",
+    "CONCRETE_DETAILS",
+    "REBAR_DETAILS",
+    "SECTIONS",
+    "DETAILS",
+    "GENERAL_DETAILS",
+    "SCHEDULES",
+    "SPECIFICATIONS_NOTES",
+    "OTHER",
+]
+
+# Civil types
+CIVIL_SHEET_TYPES = [
+    "COVER_SHEET",
+    "SHEET_INDEX_GENERAL_NOTES",
+    "EXISTING_CONDITIONS_PLAN",
+    "DEMOLITION_PLAN",
+    "SITE_PLAN",
+    "GRADING_PLAN",
+    "DRAINAGE_PLAN",
+    "UTILITY_PLAN",
+    "STORMWATER_MANAGEMENT",
+    "EROSION_SEDIMENT_CONTROL",
+    "SITE_DETAILS",
+    "PROFILES_SECTIONS",
+    "SCHEDULES",
+    "SPECIFICATIONS_NOTES",
+    "OTHER",
+]
+
+# Mechanical types
+MECHANICAL_SHEET_TYPES = [
+    "COVER_SHEET",
+    "SHEET_INDEX_GENERAL_NOTES",
+    "MECHANICAL_NOTES",
+    "HVAC_FLOOR_PLAN",
+    "EQUIPMENT_PLAN",
+    "ROOF_MECHANICAL_PLAN",
+    "DUCTWORK_PLAN",
+    "PIPING_PLAN",
+    "SCHEMATICS_DIAGRAMS",
+    "CONTROLS_DIAGRAMS",
+    "DETAILS",
+    "SECTIONS",
+    "SCHEDULES",
+    "EQUIPMENT_SCHEDULES",
+    "SPECIFICATIONS_NOTES",
+    "OTHER",
+]
+
+# Electrical types
+ELECTRICAL_SHEET_TYPES = [
+    "COVER_SHEET",
+    "SHEET_INDEX_GENERAL_NOTES",
+    "ELECTRICAL_NOTES",
+    "POWER_PLAN",
+    "LIGHTING_PLAN",
+    "LIGHTING_CONTROL_PLAN",
+    "ONE_LINE_DIAGRAM",
+    "RISER_DIAGRAM",
+    "PANEL_SCHEDULES",
+    "DETAILS",
+    "SECTIONS",
+    "SCHEDULES",
+    "SPECIFICATIONS_NOTES",
+    "OTHER",
+]
+
+# Plumbing types
+PLUMBING_SHEET_TYPES = [
+    "COVER_SHEET",
+    "SHEET_INDEX_GENERAL_NOTES",
+    "PLUMBING_NOTES",
+    "PLUMBING_FLOOR_PLAN",
+    "DOMESTIC_WATER_PLAN",
+    "SANITARY_PLAN",
+    "STORM_PLAN",
+    "GAS_PLAN",
+    "RISER_DIAGRAM",
+    "ISOMETRICS",
+    "DETAILS",
+    "SECTIONS",
+    "SCHEDULES",
+    "FIXTURE_SCHEDULES",
+    "SPECIFICATIONS_NOTES",
+    "OTHER",
+]
+
+# Fire Protection (sprinkler) types
+FIRE_PROTECTION_SHEET_TYPES = [
+    "COVER_SHEET",
+    "SHEET_INDEX_GENERAL_NOTES",
+    "FIRE_PROTECTION_NOTES",
+    "SPRINKLER_FLOOR_PLAN",
+    "STANDPIPE_PLAN",
+    "RISER_DIAGRAM",
+    "DETAILS",
+    "SECTIONS",
+    "SCHEDULES",
+    "SPECIFICATIONS_NOTES",
+    "OTHER",
+]
+
+# Fire Alarm / Low Voltage types (optional discipline bucket)
+FIRE_ALARM_LOW_VOLTAGE_SHEET_TYPES = [
+    "COVER_SHEET",
+    "SHEET_INDEX_GENERAL_NOTES",
+    "LOW_VOLTAGE_NOTES",
+    "FIRE_ALARM_PLAN",
+    "SECURITY_PLAN",
+    "DATA_TELECOM_PLAN",
+    "RISER_DIAGRAM",
+    "SINGLE_LINE_DIAGRAM",
+    "DEVICE_SCHEDULES",
+    "DETAILS",
+    "SECTIONS",
+    "SCHEDULES",
+    "SPECIFICATIONS_NOTES",
+    "OTHER",
+]
+
+# Landscape types (optional)
+LANDSCAPE_SHEET_TYPES = [
+    "COVER_SHEET",
+    "SHEET_INDEX_GENERAL_NOTES",
+    "PLANTING_PLAN",
+    "IRRIGATION_PLAN",
+    "LANDSCAPE_DETAILS",
+    "GRADING_PLAN",
+    "SCHEDULES",
+    "SPECIFICATIONS_NOTES",
+    "OTHER",
+]
+
+ALLOWED_TYPES_BY_DISCIPLINE = {
+    "ARCHITECTURAL": set(ARCH_ID_SHEET_TYPES),
+    "INTERIOR_DESIGN": set(ARCH_ID_SHEET_TYPES),
+    "STRUCTURAL": set(STRUCTURAL_SHEET_TYPES),
+    "CIVIL": set(CIVIL_SHEET_TYPES),
+    "MECHANICAL": set(MECHANICAL_SHEET_TYPES),
+    "ELECTRICAL": set(ELECTRICAL_SHEET_TYPES),
+    "PLUMBING": set(PLUMBING_SHEET_TYPES),
+    "FIRE_PROTECTION": set(FIRE_PROTECTION_SHEET_TYPES),
+    "FIRE_ALARM_LOW_VOLTAGE": set(FIRE_ALARM_LOW_VOLTAGE_SHEET_TYPES),
+    "LANDSCAPE": set(LANDSCAPE_SHEET_TYPES),
+    "UNKNOWN": set(COMMON_SHEET_TYPES),
+}
+
 
 def _clean_json_text(text: str) -> str:
     """Remove ```json fences if present."""
@@ -60,170 +250,383 @@ def _clean_json_text(text: str) -> str:
     return t
 
 
-def _normalize_arch_type(value: str) -> str:
+def normalize_sheet_type(discipline: str, value: str) -> str:
+    """
+    Normalize raw model output to a valid type for the discipline.
+    """
     v = (value or "").strip().upper()
     v = v.replace(" ", "_").replace("-", "_")
-    # common aliases
+
+    # Cross-discipline aliases (common)
     aliases = {
-        "FINISH_SCHEDULE": "ROOM_FINISH_SCHEDULES",
-        "FINISH_SCHEDULES": "ROOM_FINISH_SCHEDULES",
-        "ROOM_FINISH_SCHEDULE": "ROOM_FINISH_SCHEDULES",
-        "RFS": "ROOM_FINISH_SCHEDULES",
-        "DOOR_SCHEDULE": "DOOR_WINDOW_SCHEDULES",
-        "WINDOW_SCHEDULE": "DOOR_WINDOW_SCHEDULES",
-        "DOOR_WINDOW_SCHEDULE": "DOOR_WINDOW_SCHEDULES",
-        "GENERAL_NOTES": "SHEET_INDEX_GENERAL_NOTES",
+        "COVER": "COVER_SHEET",
+        "COVER_SHEET": "COVER_SHEET",
         "SHEET_INDEX": "SHEET_INDEX_GENERAL_NOTES",
-        "CODE": "CODE_LIFE_SAFETY",
-        "LIFE_SAFETY": "CODE_LIFE_SAFETY",
-        "EGRESS": "LIFE_SAFETY_EGRESS_PLAN",
-        "PLAN": "FLOOR_PLAN",
+        "GENERAL_NOTES": "SHEET_INDEX_GENERAL_NOTES",
+        "NOTES": "SPECIFICATIONS_NOTES",
         "DETAIL": "DETAILS",
+        "DETAILS": "DETAILS",
         "SECTION": "SECTIONS",
+        "SECTIONS": "SECTIONS",
         "ELEVATION": "ELEVATIONS",
-        "WALL_TYPES": "WALL_TYPES_ASSEMBLIES",
-        "ASSEMBLY_TYPES": "WALL_TYPES_ASSEMBLIES",
+        "ELEVATIONS": "ELEVATIONS",
+        "SCHEDULE": "SCHEDULES",
+        "SCHEDULES": "SCHEDULES",
+        "DIAGRAM": "DIAGRAMS",
+        "DIAGRAMS": "DIAGRAMS",
     }
+
+    # Arch/ID-specific aliases
+    if discipline in ["ARCHITECTURAL", "INTERIOR_DESIGN"]:
+        aliases.update({
+            "FINISH_SCHEDULE": "ROOM_FINISH_SCHEDULES",
+            "FINISH_SCHEDULES": "ROOM_FINISH_SCHEDULES",
+            "ROOM_FINISH_SCHEDULE": "ROOM_FINISH_SCHEDULES",
+            "RFS": "ROOM_FINISH_SCHEDULES",
+            "DOOR_SCHEDULE": "DOOR_WINDOW_SCHEDULES",
+            "WINDOW_SCHEDULE": "DOOR_WINDOW_SCHEDULES",
+            "DOOR_WINDOW_SCHEDULE": "DOOR_WINDOW_SCHEDULES",
+            "PLAN": "FLOOR_PLAN",
+            "WALL_TYPES": "WALL_TYPES_ASSEMBLIES",
+            "ASSEMBLY_TYPES": "WALL_TYPES_ASSEMBLIES",
+            "FINISH_LEGEND": "FINISH_LEGENDS_TAG_GLOSSARY",
+            "TAG_GLOSSARY": "FINISH_LEGENDS_TAG_GLOSSARY",
+        })
+
     if v in aliases:
         v = aliases[v]
-    return v if v in ARCH_ALLOWED_SET else "OTHER"
 
+    allowed = ALLOWED_TYPES_BY_DISCIPLINE.get(discipline, ALLOWED_TYPES_BY_DISCIPLINE["UNKNOWN"])
+    return v if v in allowed else "OTHER"
 
-def _override_by_title(sheet_title: str, sheet_id: str, base_type: str) -> str:
+def get_type_list_for_discipline(discipline: str) -> List[str]:
     """
-    Deterministic overrides based on sheet title / id.
-    This is where we eliminate obvious mislabels (egress plans, schedules, etc.).
+    Returns the allowed type list (as a stable, sorted list) for the given discipline.
+    """
+    allowed = ALLOWED_TYPES_BY_DISCIPLINE.get(discipline) or ALLOWED_TYPES_BY_DISCIPLINE["UNKNOWN"]
+    return sorted(list(allowed))
+
+
+def _extract_sheet_id_title(image_bytes: bytes) -> Dict[str, str]:
+    """
+    Pass 1: Extract sheet_identifier and sheet_title only.
+    Keeps this focused so the model doesn’t hallucinate.
+    """
+    base64_image = base64.b64encode(image_bytes).decode("utf-8")
+
+    prompt = """You are looking at ONE page from a construction drawing PDF.
+
+Extract ONLY these fields if visible:
+- sheet_identifier (examples: A-101, I-201, S-101, M-301, E-601, P-201, C-101, FP-101, FA-101, L-101)
+- sheet_title (examples: "LEVEL 1 FLOOR PLAN", "PANEL SCHEDULES", etc.)
+
+Return ONLY valid JSON:
+{
+  "sheet_identifier": "A-101",
+  "sheet_title": "LEVEL 1 FLOOR PLAN"
+}
+
+Rules:
+- Do NOT output markdown.
+- If not clearly visible, return "" for that field.
+"""
+
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}", "detail": "high"}},
+            ],
+        }],
+        max_tokens=250,
+        temperature=0.0,
+    )
+
+    raw = (resp.choices[0].message.content or "").strip()
+    cleaned = _clean_json_text(raw)
+    data = json.loads(cleaned)
+
+    return {
+        "sheet_identifier": (data.get("sheet_identifier") or "").strip(),
+        "sheet_title": (data.get("sheet_title") or "").strip(),
+    }
+
+
+def _classify_type_for_discipline(image_bytes: bytes, discipline: str) -> str:
+    """
+    Pass 2: Classify the page using the discipline-specific type list.
+    """
+    base64_image = base64.b64encode(image_bytes).decode("utf-8")
+
+    type_list = ", ".join(get_type_list_for_discipline(discipline))
+
+    prompt = f"""You are looking at ONE page from a construction drawing PDF.
+
+Discipline has been determined as: {discipline}
+
+Classify this page into exactly ONE of these types:
+{type_list}
+
+Return ONLY valid JSON:
+{{ "classification": "TYPE_HERE" }}
+
+Rules:
+- Do NOT output markdown.
+- Output must be one of the listed types exactly.
+- Choose the most specific type available.
+"""
+
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}", "detail": "high"}},
+            ],
+        }],
+        max_tokens=150,
+        temperature=0.0,
+    )
+
+    raw = (resp.choices[0].message.content or "").strip()
+    cleaned = _clean_json_text(raw)
+    data = json.loads(cleaned)
+
+    return (data.get("classification") or "").strip()
+
+
+def override_by_title(discipline: str, sheet_title: str, sheet_id: str, base_type: str) -> str:
+    """
+    Deterministic overrides based on title/id.
+    Discipline-aware so 'DETAILS' doesn't drown out everything.
     """
     title = (sheet_title or "").strip().upper()
     sid = (sheet_id or "").strip().upper()
 
-    # If title is blank, keep base_type
     if not title and not sid:
         return base_type
 
-    # Hard keyword buckets (highest confidence)
-    if any(k in title for k in ["COVER SHEET"]):
+    # Universal high-confidence
+    if "COVER" in title:
         return "COVER_SHEET"
-
-    if any(k in title for k in ["SHEET INDEX", "GENERAL NOTES", "ABBREVIATIONS", "LEGEND"]):
+    if any(k in title for k in ["SHEET INDEX", "GENERAL NOTES", "ABBREVIATIONS", "LEGEND", "SYMBOLS"]):
         return "SHEET_INDEX_GENERAL_NOTES"
 
-    # Life safety / egress plans
-    if any(k in title for k in ["EGRESS", "EXIT", "LIFE SAFETY", "LIFE-SAFETY", "EVACUATION"]):
-        return "LIFE_SAFETY_EGRESS_PLAN"
+    # ARCH/ID overrides (your existing logic, kept)
+    if discipline in ["ARCHITECTURAL", "INTERIOR_DESIGN"]:
+        if any(k in title for k in ["EGRESS", "EXIT", "LIFE SAFETY", "LIFE-SAFETY", "EVACUATION"]):
+            return "LIFE_SAFETY_EGRESS_PLAN"
 
-    # Code / analysis pages (not necessarily “plans”)
-    if any(k in title for k in ["CODE", "OCCUPANCY", "UNIT MIX", "FIRE RATING", "ACCESSIBILITY", "ADA", "IBC", "NFPA"]):
-        return "CODE_LIFE_SAFETY"
+        if any(k in title for k in ["CODE", "OCCUPANCY", "UNIT MIX", "FIRE RATING", "ACCESSIBILITY", "ADA", "IBC", "NFPA"]):
+            return "CODE_LIFE_SAFETY"
 
-    # Finish schedules
-    if any(k in title for k in ["FINISH SCHEDULE", "ROOM FINISH", "FINISH LEGEND", "FINISH PLAN LEGEND"]):
-        return "ROOM_FINISH_SCHEDULES"
+        if any(k in title for k in ["FINISH SCHEDULE", "ROOM FINISH", "FINISH LEGEND", "FINISH PLAN LEGEND"]):
+            return "ROOM_FINISH_SCHEDULES"
 
-    # Door/window schedules
-    if any(k in title for k in ["DOOR SCHEDULE", "WINDOW SCHEDULE", "STOREFRONT SCHEDULE", "FRAME SCHEDULE"]):
-        return "DOOR_WINDOW_SCHEDULES"
+        if any(k in title for k in ["DOOR SCHEDULE", "WINDOW SCHEDULE", "STOREFRONT SCHEDULE", "FRAME SCHEDULE"]):
+            return "DOOR_WINDOW_SCHEDULES"
 
-    # RCP
-    if any(k in title for k in ["REFLECTED CEILING", "RCP", "CEILING PLAN"]):
-        return "REFLECTED_CEILING_PLAN"
+        if any(k in title for k in ["REFLECTED CEILING", "RCP", "CEILING PLAN"]):
+            return "REFLECTED_CEILING_PLAN"
 
-    # Roof plan
-    if any(k in title for k in ["ROOF PLAN", "PENTHOUSE ROOF", "ROOF"]):
-        # avoid misfiring on "roof details"
-        if "DETAIL" not in title and "SECTION" not in title:
-            return "ROOF_PLAN"
+        if any(k in title for k in ["ROOF PLAN", "PENTHOUSE ROOF", "ROOF"]):
+            if "DETAIL" not in title and "SECTION" not in title:
+                return "ROOF_PLAN"
 
-    # Site plan
-    if any(k in title for k in ["SITE PLAN", "GRADING", "SITE", "UTILITY PLAN", "EROSION", "SEDIMENT"]):
-        return "SITE_PLAN"
+        if any(k in title for k in ["SITE PLAN", "GRADING", "UTILITY PLAN", "EROSION", "SEDIMENT"]):
+            return "SITE_PLAN"
 
-    # Elevations / sections / details
-    if "ELEVATION" in title or title.startswith("ELEVATIONS"):
-        return "ELEVATIONS"
+        if "ELEVATION" in title:
+            return "ELEVATIONS"
+        if "SECTION" in title:
+            return "SECTIONS"
+        if "DETAIL" in title:
+            return "DETAILS"
+        if any(k in title for k in ["WALL TYPE", "PARTITION TYPE", "ASSEMBLY", "TYPICAL WALL"]):
+            return "WALL_TYPES_ASSEMBLIES"
+        if "ENLARGED" in title or any(k in title for k in ["TOILET ROOM PLAN", "KITCHEN PLAN", "BATHROOM PLAN"]):
+            return "ENLARGED_PLAN"
 
-    if "SECTION" in title or title.startswith("SECTIONS"):
-        return "SECTIONS"
+        return base_type
 
-    if "DETAIL" in title or title.startswith("DETAILS"):
-        return "DETAILS"
+    # STRUCTURAL overrides
+    if discipline == "STRUCTURAL":
+        if any(k in title for k in ["FOUNDATION", "FOOTING", "PILE", "CAISSON"]):
+            return "FOUNDATION_PLAN"
+        if any(k in title for k in ["FRAMING", "FRAMING PLAN"]):
+            return "FRAMING_PLAN"
+        if any(k in title for k in ["ROOF FRAMING"]):
+            return "ROOF_FRAMING_PLAN"
+        if any(k in title for k in ["SLAB", "SOG", "SLAB ON GRADE"]):
+            return "SLAB_ON_GRADE_PLAN"
+        if any(k in title for k in ["CONNECTION", "STEEL CONNECTION"]):
+            return "STEEL_CONNECTION_DETAILS"
+        if any(k in title for k in ["REBAR", "REINFORCING"]):
+            return "REBAR_DETAILS"
+        if any(k in title for k in ["CONCRETE DETAIL", "CONCRETE DETAILS"]):
+            return "CONCRETE_DETAILS"
+        if any(k in title for k in ["SCHEDULE"]):
+            return "SCHEDULES"
+        if "DETAIL" in title:
+            return "DETAILS"
+        if "SECTION" in title:
+            return "SECTIONS"
+        return base_type
 
-    # Wall types / assemblies
-    if any(k in title for k in ["WALL TYPE", "PARTITION TYPE", "ASSEMBLY", "TYPICAL WALL"]):
-        return "WALL_TYPES_ASSEMBLIES"
+    # MECHANICAL overrides
+    if discipline == "MECHANICAL":
+        if any(k in title for k in ["HVAC", "MECHANICAL PLAN", "AIRFLOW"]):
+            return "HVAC_FLOOR_PLAN"
+        if any(k in title for k in ["DUCT", "DUCTWORK"]):
+            return "DUCTWORK_PLAN"
+        if any(k in title for k in ["PIPING", "HYDRONIC", "CHW", "HHW", "REFRIGERANT"]):
+            return "PIPING_PLAN"
+        if any(k in title for k in ["DIAGRAM", "SCHEMATIC", "RISER"]):
+            return "SCHEMATICS_DIAGRAMS"
+        if "SCHEDULE" in title:
+            return "EQUIPMENT_SCHEDULES"
+        if "DETAIL" in title:
+            return "DETAILS"
+        if "SECTION" in title:
+            return "SECTIONS"
+        return base_type
 
-    # Enlarged plans (toilet rooms, kitchens, etc.)
-    if "ENLARGED" in title or any(k in title for k in ["TOILET ROOM PLAN", "KITCHEN PLAN", "BATHROOM PLAN"]):
-        return "ENLARGED_PLAN"
+    # ELECTRICAL overrides
+    if discipline == "ELECTRICAL":
+        if any(k in title for k in ["POWER"]):
+            return "POWER_PLAN"
+        if any(k in title for k in ["LIGHTING"]):
+            return "LIGHTING_PLAN"
+        if any(k in title for k in ["ONE-LINE", "ONE LINE", "SINGLE LINE"]):
+            return "ONE_LINE_DIAGRAM"
+        if any(k in title for k in ["RISER"]):
+            return "RISER_DIAGRAM"
+        if any(k in title for k in ["PANEL SCHEDULE"]):
+            return "PANEL_SCHEDULES"
+        if "DETAIL" in title:
+            return "DETAILS"
+        if "SECTION" in title:
+            return "SECTIONS"
+        if "SCHEDULE" in title:
+            return "SCHEDULES"
+        return base_type
 
-    # If the model said "FLOOR_PLAN" but title screams it's not, downgrade:
-    if base_type == "FLOOR_PLAN":
-        if any(k in title for k in ["SITE", "CODE", "SCHEDULE", "DETAIL", "SECTION", "ELEVATION", "NOTES", "INDEX"]):
-            # pick the closest based on title; otherwise OTHER
-            # (most are handled above, this is just safety)
-            return "OTHER"
+    # PLUMBING overrides
+    if discipline == "PLUMBING":
+        if any(k in title for k in ["DOMESTIC", "WATER"]):
+            return "DOMESTIC_WATER_PLAN"
+        if any(k in title for k in ["SANITARY"]):
+            return "SANITARY_PLAN"
+        if any(k in title for k in ["STORM"]):
+            return "STORM_PLAN"
+        if any(k in title for k in ["GAS"]):
+            return "GAS_PLAN"
+        if any(k in title for k in ["RISER"]):
+            return "RISER_DIAGRAM"
+        if "SCHEDULE" in title:
+            return "FIXTURE_SCHEDULES"
+        if "DETAIL" in title:
+            return "DETAILS"
+        if "SECTION" in title:
+            return "SECTIONS"
+        return base_type
+
+    # CIVIL overrides
+    if discipline == "CIVIL":
+        if any(k in title for k in ["EXISTING"]):
+            return "EXISTING_CONDITIONS_PLAN"
+        if any(k in title for k in ["DEMOLITION", "DEMO"]):
+            return "DEMOLITION_PLAN"
+        if any(k in title for k in ["GRADING"]):
+            return "GRADING_PLAN"
+        if any(k in title for k in ["DRAINAGE"]):
+            return "DRAINAGE_PLAN"
+        if any(k in title for k in ["UTILITY"]):
+            return "UTILITY_PLAN"
+        if any(k in title for k in ["EROSION", "SEDIMENT"]):
+            return "EROSION_SEDIMENT_CONTROL"
+        if "DETAIL" in title:
+            return "SITE_DETAILS"
+        if "PROFILE" in title or "SECTION" in title:
+            return "PROFILES_SECTIONS"
+        if "SCHEDULE" in title:
+            return "SCHEDULES"
+        return base_type
+
+    # FIRE PROTECTION overrides
+    if discipline == "FIRE_PROTECTION":
+        if any(k in title for k in ["SPRINKLER", "FIRE PROTECTION"]):
+            return "SPRINKLER_FLOOR_PLAN"
+        if any(k in title for k in ["STANDPIPE"]):
+            return "STANDPIPE_PLAN"
+        if any(k in title for k in ["RISER"]):
+            return "RISER_DIAGRAM"
+        if "DETAIL" in title:
+            return "DETAILS"
+        if "SECTION" in title:
+            return "SECTIONS"
+        if "SCHEDULE" in title:
+            return "SCHEDULES"
+        return base_type
 
     return base_type
+
 
 import re
 
 
-def _infer_discipline_from_sheet_id(sheet_id: str | None) -> str:
+def infer_discipline_from_sheet_id(sheet_id: str | None) -> str:
+    """
+    Robust discipline inference from sheet identifier.
+    Examples:
+      A-101 -> ARCHITECTURAL
+      I-201 / ID-201 -> INTERIOR_DESIGN
+      S-101 -> STRUCTURAL
+      C-101 -> CIVIL
+      M-101 -> MECHANICAL
+      E-101 -> ELECTRICAL
+      P-101 -> PLUMBING
+      FP-101 -> FIRE_PROTECTION
+      FA-101 -> FIRE_ALARM_LOW_VOLTAGE
+      L-101 -> LANDSCAPE
+    """
     raw = (sheet_id or "").strip().upper()
     if not raw:
-        return "Unknown"
+        return "UNKNOWN"
 
-    # Normalize common hyphen/dash variants to ASCII hyphen
+    # normalize dash variants
     raw = raw.translate(str.maketrans({
-        "\u2010": "-",  # hyphen
-        "\u2011": "-",  # non-breaking hyphen  ✅ this is the one you're missing
-        "\u2012": "-",  # figure dash
-        "\u2013": "-",  # en dash
-        "\u2014": "-",  # em dash
-        "\u2212": "-",  # minus sign
-        "\ufe63": "-",  # small hyphen-minus
-        "\uff0d": "-",  # fullwidth hyphen-minus
+        "–": "-", "—": "-", "-": "-", "−": "-", "﹣": "-", "－": "-"
     }))
 
-    # Allow optional suffix like I-201A, and allow spaces as separators too
-    m = re.search(r"\b([A-Z]{1,3})\s*[-\s]\s*(\d{2,4})\b", raw)
-    if m:
-        prefix = m.group(1)
-    else:
-        # fallback: first token of 1-3 letters
-        m2 = re.search(r"\b([A-Z]{1,3})\b", raw)
-        prefix = m2.group(1) if m2 else ""
-
-    prefix = prefix.strip()
+    m = re.search(r"\b([A-Z]{1,3})\s*-\s*\d+", raw)
+    prefix = m.group(1) if m else raw[:2].strip()
 
     if prefix == "A":
-        return "Architectural"
+        return "ARCHITECTURAL"
     if prefix in ["I", "ID"]:
-        return "Interior Design"
+        return "INTERIOR_DESIGN"
     if prefix == "S":
-        return "Structural"
+        return "STRUCTURAL"
     if prefix == "C":
-        return "Civil"
+        return "CIVIL"
     if prefix == "M":
-        return "Mechanical"
+        return "MECHANICAL"
     if prefix == "E":
-        return "Electrical"
+        return "ELECTRICAL"
     if prefix == "P":
-        return "Plumbing"
+        return "PLUMBING"
     if prefix == "FP":
-        return "Fire Protection"
+        return "FIRE_PROTECTION"
+    if prefix in ["FA", "LV", "T", "ELV"]:
+        return "FIRE_ALARM_LOW_VOLTAGE"
+    if prefix in ["L", "LA"]:
+        return "LANDSCAPE"
 
-    return "Unknown"
-
-
-def _drawing_type_from_coarse_classification(classification: str) -> str:
-    c = (classification or "").strip().upper()
-    if c == "FINISH_SCHEDULE":
-        return "ROOM_FINISH_SCHEDULES"
-    if c == "FLOOR_PLAN":
-        return "FLOOR_PLAN"
-    return "OTHER"
-
+    return "UNKNOWN"
 
 # -----------------------------
 # Configuration
@@ -673,74 +1076,29 @@ def _clean_json_text(text: str) -> str:
 
 def _classify_single_page(image_bytes: bytes) -> Dict[str, str]:
     """
-    Classify a single PDF page image into an Architectural sheet type.
-    Also attempt to read sheet_identifier and sheet_title if visible.
-    Then apply deterministic overrides based on title/id.
+    Discipline-aware page classifier:
+    1) Extract sheet id/title
+    2) Infer discipline from sheet id
+    3) Classify type using discipline-specific allowed list
+    4) Normalize + override deterministically
     """
-    base64_image = base64.b64encode(image_bytes).decode("utf-8")
+    meta = _extract_sheet_id_title(image_bytes)
+    sheet_id = meta["sheet_identifier"]
+    sheet_title = meta["sheet_title"]
 
-    type_list = ", ".join(ARCH_SHEET_TYPES)
+    discipline = infer_discipline_from_sheet_id(sheet_id)
 
-    prompt = f"""You are looking at ONE page from a construction drawing PDF (Architectural set).
-
-Your job:
-1) Visually classify this page into exactly ONE of these types:
-{type_list}
-
-2) If visible, extract:
-- sheet_identifier (examples: A101, A0.01, AS-201, I-201, I-411, I-601, ID-201, etc.)
-- sheet_title (examples: "LEVEL 2 FLOOR PLAN", "DOOR SCHEDULE", etc.)
-
-Return ONLY valid JSON in exactly this format:
-{{
-  "classification": "FLOOR_PLAN",
-  "sheet_identifier": "A101",
-  "sheet_title": "LEVEL 1 FLOOR PLAN"
-}}
-
-Rules:
-- Do NOT output markdown.
-- If sheet_identifier or sheet_title are not clearly visible, return "" for them.
-- Choose the most specific type available (e.g., if it’s an EGRESS plan, choose LIFE_SAFETY_EGRESS_PLAN, not FLOOR_PLAN).
-"""
-
-    resp = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{base64_image}",
-                            "detail": "high",
-                        },
-                    },
-                ],
-            }
-        ],
-        max_tokens=400,
-        temperature=0.0,
-    )
-
-    raw = (resp.choices[0].message.content or "").strip()
-    cleaned = _clean_json_text(raw)
-    data = json.loads(cleaned)
-
-    sheet_id = (data.get("sheet_identifier") or "").strip()
-    sheet_title = (data.get("sheet_title") or "").strip()
-
-    base_type = _normalize_arch_type(data.get("classification") or "OTHER")
-    final_type = _override_by_title(sheet_title, sheet_id, base_type)
+    model_type = _classify_type_for_discipline(image_bytes, discipline)
+    base_type = normalize_sheet_type(discipline, model_type)
+    final_type = override_by_title(discipline, sheet_title, sheet_id, base_type)
 
     return {
-        "classification": final_type,
+        "discipline": discipline,
+        "drawing_type": final_type,
         "sheet_identifier": sheet_id,
         "sheet_title": sheet_title,
+        "model_type": model_type,  # debug
     }
-
 
 
 @app.post("/classify-pdf")
@@ -793,21 +1151,22 @@ async def classify_pdf(request: ClassifyPdfRequest):
             print("DEBUG classify:", page_number, page_info)
             sheet_id = page_info.get("sheet_identifier")
             sheet_title = page_info.get("sheet_title")
-            classification = page_info.get("classification")
 
-            discipline = _infer_discipline_from_sheet_id(sheet_id)
-            drawing_type = _drawing_type_from_coarse_classification(classification)
+            discipline = page_info.get("discipline") or infer_discipline_from_sheet_id(sheet_id)
+            drawing_type = page_info.get("drawing_type") or "OTHER"
+
 
             pages_out.append({
-                "page_number": page_number,  # keep 1-based in output
-                "classification": classification,
+                "page_number": page_number,
                 "sheet_identifier": sheet_id,
                 "sheet_title": sheet_title,
-
-                # ✅ NEW (Deliverable 2)
                 "discipline": discipline,
                 "drawing_type": drawing_type,
+
+                # optional debug fields:
+                "model_type": page_info.get("model_type", ""),
             })
+
 
 
         doc.close()
