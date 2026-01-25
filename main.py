@@ -21,7 +21,7 @@ from openai import OpenAI
 import re
 import json
 import base64
-
+import pdfplumber
 
 # ----------------------------
 # DISCIPLINE + DRAWING TAXONOMY (Phase 1)
@@ -658,8 +658,15 @@ class PageIndexPage(BaseModel):
     page_number: int
     sheet_identifier: Optional[str] = None
     sheet_title: Optional[str] = None
-    classification: Optional[str] = None  # current: FINISH_SCHEDULE / FLOOR_PLAN / OTHER
-    discipline: Optional[str] = None   # ✅ ADD THIS
+
+    # ✅ use this going forward (matches /classify-pdf output)
+    drawing_type: Optional[str] = None
+
+    # (optional) keep for backward compatibility if Base44 ever stored "classification"
+    classification: Optional[str] = None
+
+    discipline: Optional[str] = None
+
 
 class PageIndexPayload(BaseModel):
     filename: str
@@ -749,6 +756,92 @@ class ExtractByTagsRequest(BaseModel):
     filename: str
     page_number: int
     tags: List[str]
+
+class ExtractNotesV1Request(BaseModel):
+    filename: str
+    pages: List[Dict[str, Any]]  # Base44 stored PageIndex.pagesJson parsed into a list
+
+# -----------------------------
+# Phase 2 Stream B (Notes/Keynotes) helpers
+# -----------------------------
+
+NOTES_DRAWING_TYPES = {
+    # ✅ Core notes buckets (appear in multiple disciplines)
+    "SHEET_INDEX_GENERAL_NOTES",
+    "SPECIFICATIONS_NOTES",
+    "CODE_LIFE_SAFETY",
+    "LEGENDS_SYMBOLS_ABBREVIATIONS",
+
+    # ✅ Typical “notes-like” pages by discipline (you already defined these)
+    "GENERAL_STRUCTURAL_NOTES",
+    "MECHANICAL_NOTES",
+    "ELECTRICAL_NOTES",
+    "PLUMBING_NOTES",
+    "FIRE_PROTECTION_NOTES",
+    "LOW_VOLTAGE_NOTES",
+
+    # ✅ Often contains real scope drivers / narrative requirements
+    # (Not always “notes”, but in practice behaves like notes/requirements)
+    "WALL_TYPES_ASSEMBLIES",
+}
+
+
+def _is_notes_page(p: Dict[str, Any]) -> bool:
+    dt = (p.get("drawing_type") or p.get("classification") or "").strip().upper()
+
+    # Exact matches (high confidence)
+    if dt in NOTES_DRAWING_TYPES:
+        return True
+
+    # Heuristic: anything with NOTES in the type name counts as notes-like
+    # (covers future taxonomy additions without updating this list)
+    if "NOTES" in dt:
+        return True
+
+    # Common legend pages across disciplines
+    if "LEGEND" in dt or "SYMBOL" in dt or "ABBREVIATION" in dt:
+        return True
+
+    return False
+
+def _parse_numbered_notes(text: str) -> List[Dict[str, Any]]:
+    """
+    Pull notes like:
+      1. text...
+      2) text...
+      3: text...
+    Joins wrapped lines into the note.
+    """
+    lines = [ln.rstrip() for ln in (text or "").splitlines()]
+    notes: List[Dict[str, Any]] = []
+    current_key = None
+    current_parts: List[str] = []
+
+    def flush():
+        nonlocal current_key, current_parts
+        if current_key and current_parts:
+            notes.append({
+                "note_id": current_key,
+                "text": " ".join(" ".join(current_parts).split())
+            })
+        current_key = None
+        current_parts = []
+
+    key_re = re.compile(r"^\s*(\d{1,4})\s*[\)\.\:]\s+(.*)$")
+
+    for ln in lines:
+        m = key_re.match(ln)
+        if m:
+            flush()
+            current_key = m.group(1)
+            current_parts.append(m.group(2))
+        else:
+            if current_key and ln.strip():
+                current_parts.append(ln.strip())
+
+    flush()
+    return notes
+
 
 # -----------------------------
 # Core Extraction Logic
@@ -1066,6 +1159,85 @@ async def extract_finish_schedule_by_tags(request: ExtractByTagsRequest):
             status_code=500,
             detail=f"Extraction failed: {str(e)}"
         )
+
+@app.post("/extract-notes-v1")
+async def extract_notes_v1(request: ExtractNotesV1Request):
+    """
+    Phase 2 Stream B v1:
+    - Select pages by drawing_type (General Notes / Code / Legends / Wall Types)
+    - Extract text with pdfplumber
+    - Parse numbered notes where possible
+    - Fallback to a text snippet if not numbered
+    """
+    try:
+        filepath = UPLOAD_DIR / request.filename
+        if not filepath.exists():
+            raise HTTPException(status_code=404, detail=f"PDF file not found: {request.filename}")
+
+        target_pages = [p for p in request.pages if _is_notes_page(p)]
+        page_numbers = sorted({
+            int(p.get("page_number"))
+            for p in target_pages
+            if p.get("page_number") is not None
+        })
+
+        if not page_numbers:
+            return JSONResponse({
+                "ok": True,
+                "filename": request.filename,
+                "page_numbers_scanned": [],
+                "note_items": [],
+                "summary": {"notes_found": 0, "pages_scanned": 0},
+                "message": "No notes pages found (by drawing_type)."
+            })
+
+        note_items: List[Dict[str, Any]] = []
+
+        with pdfplumber.open(str(filepath)) as pdf:
+            total_pages = len(pdf.pages)
+
+            for pn in page_numbers:
+                idx = pn - 1  # ✅ your system is 1-based page_number
+                if idx < 0 or idx >= total_pages:
+                    continue
+
+                text = pdf.pages[idx].extract_text() or ""
+                parsed = _parse_numbered_notes(text)
+
+                if parsed:
+                    for n in parsed:
+                        note_items.append({
+                            "source_page_number": pn,
+                            "note_id": n["note_id"],
+                            "text": n["text"],
+                            "parse_method": "numbered_notes"
+                        })
+                else:
+                    cleaned = " ".join(text.strip().split())
+                    if cleaned:
+                        note_items.append({
+                            "source_page_number": pn,
+                            "note_id": None,
+                            "text": cleaned[:4000],
+                            "parse_method": "fulltext_snippet"
+                        })
+
+        return JSONResponse({
+            "ok": True,
+            "filename": request.filename,
+            "page_numbers_scanned": page_numbers,
+            "note_items": note_items,
+            "summary": {
+                "notes_found": len(note_items),
+                "pages_scanned": len(page_numbers)
+            }
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"extract-notes-v1 failed: {str(e)}")
+
 
 class ClassifyPdfRequest(BaseModel):
     filename: str
