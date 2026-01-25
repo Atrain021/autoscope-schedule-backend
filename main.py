@@ -28,6 +28,7 @@ from typing import Dict, Optional
 # Helper for Drawing Type - need to expand for all sets
 # -----------------------------
 
+
 ARCH_SHEET_TYPES = [
     "COVER_SHEET",
     "SHEET_INDEX_GENERAL_NOTES",
@@ -165,6 +166,66 @@ def _override_by_title(sheet_title: str, sheet_id: str, base_type: str) -> str:
             return "OTHER"
 
     return base_type
+
+import re
+
+def _infer_discipline_from_sheet_id(sheet_id: str | None) -> str:
+    """
+    Robust discipline inference from sheet identifier.
+    Handles I-201, I–201 (en-dash), ID-201, A-101, FP-101, etc.
+    """
+    raw = (sheet_id or "").strip().upper()
+
+    if not raw:
+        return "Unknown"
+
+    # Normalize different dash characters to a normal hyphen
+    raw = raw.replace("–", "-").replace("—", "-")
+
+    # Extract the leading sheet prefix token.
+    # Examples this catches:
+    #   "I-201" -> "I"
+    #   "ID-201" -> "ID"
+    #   "FP-101" -> "FP"
+    #   "SHEET I-201" -> "I"
+    m = re.search(r"\b([A-Z]{1,3})\s*-\s*\d+", raw)
+    if m:
+        prefix = m.group(1)
+    else:
+        # fallback: grab first 1–3 letters in the string
+        m2 = re.search(r"\b([A-Z]{1,3})\b", raw)
+        prefix = m2.group(1) if m2 else ""
+
+    prefix = prefix.strip()
+
+    # Map to discipline
+    if prefix == "A":
+        return "Architectural"
+    if prefix in ["I", "ID"]:
+        return "Interior Design"
+    if prefix == "S":
+        return "Structural"
+    if prefix == "C":
+        return "Civil"
+    if prefix == "M":
+        return "Mechanical"
+    if prefix == "E":
+        return "Electrical"
+    if prefix == "P":
+        return "Plumbing"
+    if prefix == "FP":
+        return "Fire Protection"
+
+    return "Unknown"
+
+
+def _drawing_type_from_coarse_classification(classification: str) -> str:
+    c = (classification or "").strip().upper()
+    if c == "FINISH_SCHEDULE":
+        return "ROOM_FINISH_SCHEDULES"
+    if c == "FLOOR_PLAN":
+        return "FLOOR_PLAN"
+    return "OTHER"
 
 
 # -----------------------------
@@ -732,12 +793,24 @@ async def classify_pdf(request: ClassifyPdfRequest):
 
 
             page_info = _classify_single_page(image_bytes)
+            sheet_id = page_info.get("sheet_identifier")
+            sheet_title = page_info.get("sheet_title")
+            classification = page_info.get("classification")
+
+            discipline = _infer_discipline_from_sheet_id(sheet_id)
+            drawing_type = _drawing_type_from_coarse_classification(classification)
+
             pages_out.append({
                 "page_number": page_number,  # keep 1-based in output
-                "classification": page_info["classification"],
-                "sheet_identifier": page_info["sheet_identifier"],
-                "sheet_title": page_info["sheet_title"],
+                "classification": classification,
+                "sheet_identifier": sheet_id,
+                "sheet_title": sheet_title,
+
+                # ✅ NEW (Deliverable 2)
+                "discipline": discipline,
+                "drawing_type": drawing_type,
             })
+
 
         doc.close()
 
