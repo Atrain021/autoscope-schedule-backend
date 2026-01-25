@@ -1008,6 +1008,52 @@ def _extract_column_texts(pdf_page) -> List[str]:
 
     return col_texts
 
+def _extract_two_column_texts_by_crop(pdf_page) -> List[str]:
+    """
+    Deterministic 2-column reader:
+    - crops the page into left/right halves (with a gutter)
+    - extracts words from each crop
+    - reconstructs lines top->bottom inside each crop
+    Returns [left_text, right_text] (empty strings removed).
+    """
+    w = float(getattr(pdf_page, "width", 0) or 0)
+    h = float(getattr(pdf_page, "height", 0) or 0)
+    if w <= 0 or h <= 0:
+        t = pdf_page.extract_text() or ""
+        return [t] if t else []
+
+    gutter = max(12.0, w * 0.02)  # 2% width or 12pt
+    mid = w / 2.0
+
+    # Keep consistent with your bbox logic (drop title block)
+    top_crop = 0.0
+    bottom_crop = h * 0.88
+
+    left = pdf_page.crop((0, top_crop, mid - gutter, bottom_crop))
+    right = pdf_page.crop((mid + gutter, top_crop, w, bottom_crop))
+
+    def words_to_text(p) -> str:
+        words = p.extract_words(
+            x_tolerance=2,
+            y_tolerance=2,
+            keep_blank_chars=False,
+            use_text_flow=False,
+        )
+        if not words:
+            return ""
+        lines = _words_to_lines(words)
+        return "\n".join(lines).strip()
+
+    left_text = words_to_text(left)
+    right_text = words_to_text(right)
+
+    out: List[str] = []
+    if left_text:
+        out.append(left_text)
+    if right_text:
+        out.append(right_text)
+    return out
+
 
 def _looks_like_numbered_notes_page(text: str) -> bool:
     t = (text or "").upper()
@@ -1670,9 +1716,7 @@ async def extract_notes_v1(request: ExtractNotesV1Request):
                 # 4) Last resort: raw pdfplumber text
                 if not text.strip():
                     # For notes sheets: use column-aware reading order to avoid left/right interleaving
-                    text = page.extract_text() or ""
-
-
+                    text = _extract_text_reading_order_auto_columns(page) or (page.extract_text() or "")
 
 
                 # ✅ NEW: parse per column (prevents left/right interleaving)
@@ -1682,10 +1726,14 @@ async def extract_notes_v1(request: ExtractNotesV1Request):
                 # otherwise use the bbox-cropped page.
                 if chosen_regions:
                     for rb in chosen_regions:
-                        cropped_region = page.crop(rb)
-                        col_texts = _extract_column_texts(cropped_region)
+                        cropped_bbox = page.crop(bbox)
+                        col_texts = _extract_two_column_texts_by_crop(cropped_bbox)
+                        for col_text in col_texts:
+                            page_notes.extend(_parse_numbered_notes(col_text))
 
-                        # Fallback if columnizer finds nothing
+
+
+                        # Fallback if crop method finds nothing
                         if not col_texts:
                             fallback_text = _extract_text_reading_order_auto_columns(cropped_region) or (cropped_region.extract_text() or "")
                             col_texts = [fallback_text] if fallback_text else []
@@ -1694,7 +1742,9 @@ async def extract_notes_v1(request: ExtractNotesV1Request):
                             page_notes.extend(_parse_numbered_notes(col_text))
                 else:
                     cropped_bbox = page.crop(bbox)
-                    col_texts = _extract_column_texts(cropped_bbox)
+
+                    # ✅ HARD SPLIT into left/right halves (prevents interleaving)
+                    col_texts = _extract_two_column_texts_by_crop(cropped_bbox)
 
                     if not col_texts:
                         fallback_text = _extract_text_reading_order_auto_columns(cropped_bbox) or (cropped_bbox.extract_text() or "")
@@ -1704,13 +1754,14 @@ async def extract_notes_v1(request: ExtractNotesV1Request):
                         page_notes.extend(_parse_numbered_notes(col_text))
 
 
+
                 if page_notes:
                     for n in page_notes:
                         note_items.append({
                             "source_page_number": pn,
                             "note_id": n["note_id"],
                             "text": n["text"],
-                            "parse_method": "numbered_notes_column_aware"
+                            "parse_method": "numbered_notes_two_column_crop"
                         })
                 else:
                     # fallback snippet (only if it really looks notes-like)
