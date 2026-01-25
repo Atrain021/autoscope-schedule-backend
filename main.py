@@ -972,6 +972,42 @@ def _extract_text_reading_order_auto_columns(pdf_page) -> str:
 
     return "\n".join(all_lines).strip()
 
+def _extract_column_texts(pdf_page) -> List[str]:
+    """
+    Return separate column texts (left->right), so we can parse notes per column.
+    This prevents 1 from swallowing 18/19/2 etc.
+    """
+    words = pdf_page.extract_words(
+        x_tolerance=2,
+        y_tolerance=2,
+        keep_blank_chars=False,
+        use_text_flow=False,
+    )
+    if not words:
+        return []
+
+    page_width = float(getattr(pdf_page, "width", 0) or 0)
+    if page_width <= 0:
+        page_width = max(w["x1"] for w in words)
+
+    columns = _cluster_columns(words, page_width)
+
+    # Prevent over-splitting (stamps/title blocks can create extra “columns”)
+    if len(columns) > 6:
+        columns = [words]
+
+    # Sort columns left->right
+    columns = sorted(columns, key=lambda col: min(w["x0"] for w in col))
+
+    col_texts: List[str] = []
+    for col in columns:
+        col_lines = _words_to_lines(col)
+        col_text = "\n".join(col_lines).strip()
+        if col_text:
+            col_texts.append(col_text)
+
+    return col_texts
+
 
 def _looks_like_numbered_notes_page(text: str) -> bool:
     t = (text or "").upper()
@@ -1633,32 +1669,59 @@ async def extract_notes_v1(request: ExtractNotesV1Request):
 
                 # 4) Last resort: raw pdfplumber text
                 if not text.strip():
+                    # For notes sheets: use column-aware reading order to avoid left/right interleaving
                     text = page.extract_text() or ""
 
 
 
-                parsed = _parse_numbered_notes(text)
 
-                if parsed:
-                    for n in parsed:
+                # ✅ NEW: parse per column (prevents left/right interleaving)
+                page_notes: List[Dict[str, Any]] = []
+
+                # Prefer column extraction from the chosen regions if we have them,
+                # otherwise use the bbox-cropped page.
+                if chosen_regions:
+                    for rb in chosen_regions:
+                        cropped_region = page.crop(rb)
+                        col_texts = _extract_column_texts(cropped_region)
+
+                        # Fallback if columnizer finds nothing
+                        if not col_texts:
+                            fallback_text = _extract_text_reading_order_auto_columns(cropped_region) or (cropped_region.extract_text() or "")
+                            col_texts = [fallback_text] if fallback_text else []
+
+                        for col_text in col_texts:
+                            page_notes.extend(_parse_numbered_notes(col_text))
+                else:
+                    cropped_bbox = page.crop(bbox)
+                    col_texts = _extract_column_texts(cropped_bbox)
+
+                    if not col_texts:
+                        fallback_text = _extract_text_reading_order_auto_columns(cropped_bbox) or (cropped_bbox.extract_text() or "")
+                        col_texts = [fallback_text] if fallback_text else []
+
+                    for col_text in col_texts:
+                        page_notes.extend(_parse_numbered_notes(col_text))
+
+
+                if page_notes:
+                    for n in page_notes:
                         note_items.append({
                             "source_page_number": pn,
                             "note_id": n["note_id"],
                             "text": n["text"],
-                            "parse_method": "numbered_notes"
+                            "parse_method": "numbered_notes_column_aware"
                         })
                 else:
-                    # ✅ Only fallback to snippet if it actually looks like a notes page
-                    if _looks_like_numbered_notes_page(text) and _notes_region_score(text) >= 6.0:
-                        cleaned = " ".join(text.strip().split())
-                        if cleaned:
-                            note_items.append({
-                                "source_page_number": pn,
-                                "note_id": None,
-                                "text": cleaned[:2000],   # reduce to 2000 to avoid junk floods
-                                "parse_method": "fulltext_snippet"
-                            })
-
+                    # fallback snippet (only if it really looks notes-like)
+                    cleaned = " ".join(text.strip().split())
+                    if cleaned and _looks_like_numbered_notes_page(cleaned) and _notes_region_score(text) >= 6.0:
+                        note_items.append({
+                            "source_page_number": pn,
+                            "note_id": None,
+                            "text": cleaned[:2000],
+                            "parse_method": "fulltext_snippet_column_aware"
+                        })
 
         return JSONResponse({
             "ok": True,
