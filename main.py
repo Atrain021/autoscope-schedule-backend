@@ -167,45 +167,35 @@ def _override_by_title(sheet_title: str, sheet_id: str, base_type: str) -> str:
 
 import re
 
-def _infer_discipline_from_sheet_id(sheet_id: str | None) -> str:
-    """
-    Robust discipline inference from sheet identifier.
-    Handles I-201, I–201 (en-dash), ID-201, A-101, FP-101, etc.
-    """
-    raw = (sheet_id or "").strip().upper()
 
+def _infer_discipline_from_sheet_id(sheet_id: str | None) -> str:
+    raw = (sheet_id or "").strip().upper()
     if not raw:
         return "Unknown"
 
-    # Normalize different dash characters to a normal hyphen
-    # Normalize many dash/hyphen variants to standard hyphen
+    # Normalize common hyphen/dash variants to ASCII hyphen
     raw = raw.translate(str.maketrans({
-        "–": "-",  # en-dash
-        "—": "-",  # em-dash
-        "-": "-",  # non-breaking hyphen (U+2011)
-        "−": "-",  # minus sign (U+2212)
-        "﹣": "-",  # small hyphen-minus
-        "－": "-",  # fullwidth hyphen-minus
+        "\u2010": "-",  # hyphen
+        "\u2011": "-",  # non-breaking hyphen  ✅ this is the one you're missing
+        "\u2012": "-",  # figure dash
+        "\u2013": "-",  # en dash
+        "\u2014": "-",  # em dash
+        "\u2212": "-",  # minus sign
+        "\ufe63": "-",  # small hyphen-minus
+        "\uff0d": "-",  # fullwidth hyphen-minus
     }))
 
-
-    # Extract the leading sheet prefix token.
-    # Examples this catches:
-    #   "I-201" -> "I"
-    #   "ID-201" -> "ID"
-    #   "FP-101" -> "FP"
-    #   "SHEET I-201" -> "I"
-    m = re.search(r"\b([A-Z]{1,3})\s*-\s*\d+", raw)
+    # Allow optional suffix like I-201A, and allow spaces as separators too
+    m = re.search(r"\b([A-Z]{1,3})\s*[-\s]\s*(\d{2,4})\b", raw)
     if m:
         prefix = m.group(1)
     else:
-        # fallback: grab first 1–3 letters in the string
+        # fallback: first token of 1-3 letters
         m2 = re.search(r"\b([A-Z]{1,3})\b", raw)
         prefix = m2.group(1) if m2 else ""
 
     prefix = prefix.strip()
 
-    # Map to discipline
     if prefix == "A":
         return "Architectural"
     if prefix in ["I", "ID"]:
