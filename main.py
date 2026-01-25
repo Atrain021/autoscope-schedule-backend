@@ -815,7 +815,8 @@ async def classify_pdf(request: ClassifyPdfRequest):
         return JSONResponse({
             "filename": request.filename,
             "total_pages": total_pages,
-            "pages": pages_out
+            "pages": pages_out,
+            "source": "autoscope-python-backend"
         })
 
     except HTTPException:
