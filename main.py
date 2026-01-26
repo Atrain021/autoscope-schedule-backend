@@ -858,7 +858,7 @@ def parse_numbered_notes_robust(text: str) -> List[Dict[str, Any]]:
                 combined_text = ' '.join(current_text_parts)
                 combined_text = ' '.join(combined_text.split())  # Normalize whitespace
                 
-                if len(combined_text) > 10:  # Filter very short "notes" (likely false positives)
+                if len(combined_text) > 15:  # Filter very short "notes" (likely false positives)
                     notes.append({
                         'note_id': current_note_id,
                         'text': combined_text
@@ -884,7 +884,7 @@ def parse_numbered_notes_robust(text: str) -> List[Dict[str, Any]]:
         combined_text = ' '.join(current_text_parts)
         combined_text = ' '.join(combined_text.split())
         
-        if len(combined_text) > 10:
+        if len(combined_text) > 15:
             notes.append({
                 'note_id': current_note_id,
                 'text': combined_text
@@ -914,73 +914,77 @@ def _dedupe_notes(notes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 import statistics
 from typing import List, Dict, Any, Tuple
 
-def detect_columns_conservative(words: List[Dict], page_width: float) -> List[Tuple[float, float]]:
+def detect_columns_by_text_flow(words: List[Dict], page_width: float, page_height: float) -> List[Tuple[float, float]]:
     """
-    Conservative column detection that only splits on VERY clear gutters.
+    Improved column detection using text flow analysis.
     
     Strategy:
-    1. Look for vertical strips with NO words (true gutters)
-    2. Gutter must be at least 50pts wide (very conservative)
-    3. Gutter must span most of the page height
-    4. Only split if gutter is near page center (± 20%)
+    1. Analyze vertical alignment patterns of text
+    2. Find natural breaks in x-position distribution
+    3. Use statistical clustering to identify column boundaries
     """
-    if not words or len(words) < 20:  # Too few words = probably single column
+    if not words or len(words) < 20:
         return [(0, page_width)]
     
-    # Get all word bounding boxes
-    word_spans = [(w['x0'], w['x1'], w['top'], w['bottom']) for w in words]
+    # Get left edges of all words
+    left_edges = sorted([w['x0'] for w in words])
     
-    # Define center zone (40-60% of page width)
-    center_min = page_width * 0.4
-    center_max = page_width * 0.6
+    # Look for gaps in the distribution
+    gaps = []
+    for i in range(len(left_edges) - 1):
+        gap = left_edges[i + 1] - left_edges[i]
+        if gap > 30:  # Minimum gap threshold
+            gaps.append({
+                'position': (left_edges[i] + left_edges[i + 1]) / 2,
+                'size': gap
+            })
     
-    # Find gaps in the center zone
-    MIN_GUTTER_WIDTH = 50  # Very conservative - half inch at 100 DPI
+    if not gaps:
+        return [(0, page_width)]
     
-    # Sort words by x position
-    word_spans.sort(key=lambda w: w[0])
+    # Find the most significant gap (likely column divider)
+    # Prefer gaps near the center of the page
+    center = page_width / 2
     
-    # Look for gaps between consecutive words
-    potential_gutters = []
-    for i in range(len(word_spans) - 1):
-        gap_start = word_spans[i][1]  # Right edge of current word
-        gap_end = word_spans[i + 1][0]  # Left edge of next word
-        gap_width = gap_end - gap_start
-        gap_center = (gap_start + gap_end) / 2
-        
-        # Only consider gaps in the center zone that are wide enough
-        if (center_min <= gap_center <= center_max and 
-            gap_width >= MIN_GUTTER_WIDTH):
-            potential_gutters.append((gap_start, gap_end, gap_width))
+    def gap_score(g):
+        # Score based on gap size and proximity to center
+        distance_from_center = abs(g['position'] - center)
+        center_factor = 1 - (distance_from_center / (page_width / 2))
+        return g['size'] * (0.5 + 0.5 * center_factor)
     
-    if not potential_gutters:
-        return [(0, page_width)]  # No clear gutter found
+    gaps.sort(key=gap_score, reverse=True)
+    best_gap = gaps[0]
     
-    # Use the widest gutter in the center zone
-    potential_gutters.sort(key=lambda g: g[2], reverse=True)
-    best_gutter = potential_gutters[0]
+    # Create column boundaries
+    split_point = best_gap['position']
     
-    split_point = (best_gutter[0] + best_gutter[1]) / 2
+    # Find actual content boundaries
+    left_words = [w for w in words if w['x0'] < split_point]
+    right_words = [w for w in words if w['x0'] >= split_point]
+    
+    if not left_words or not right_words:
+        return [(0, page_width)]
+    
+    left_max = max(w['x1'] for w in left_words)
+    right_min = min(w['x0'] for w in right_words)
     
     return [
-        (0, best_gutter[0]),           # Left column
-        (best_gutter[1], page_width)   # Right column
+        (0, left_max + 5),  # Small padding
+        (right_min - 5, page_width)
     ]
 
 
-
-def extract_text_by_region(pdf_page, bbox: Tuple[float, float, float, float]) -> str:
+def extract_text_strict_bbox(pdf_page, bbox: Tuple[float, float, float, float]) -> str:
     """
-    Extract text from a region WITHOUT layout mode to avoid line break issues.
+    Extract text with STRICT boundary enforcement.
     
-    Instead, we'll reconstruct lines based on y-position clustering.
+    Key improvement: Filter out any words that extend beyond bbox boundaries.
     """
     x0, top, x1, bottom = bbox
     
     try:
         cropped = pdf_page.crop((x0, top, x1, bottom))
         
-        # Extract words with their positions
         words = cropped.extract_words(
             x_tolerance=3,
             y_tolerance=3,
@@ -990,18 +994,30 @@ def extract_text_by_region(pdf_page, bbox: Tuple[float, float, float, float]) ->
         if not words:
             return ""
         
-        # Group words into lines based on y-position
-        lines_dict = {}
+        # CRITICAL: Filter words that extend beyond our bbox
+        # This prevents text from adjacent columns bleeding in
+        filtered_words = []
         for word in words:
-            # Round y position to nearest 2 points to group words on same line
-            y_key = round(word['top'] / 2) * 2
+            # Convert word coords back to original page space
+            word_x0 = word['x0'] + x0
+            word_x1 = word['x1'] + x0
             
+            # Only keep words FULLY contained in our column
+            if word_x0 >= x0 and word_x1 <= x1:
+                filtered_words.append(word)
+        
+        if not filtered_words:
+            return ""
+        
+        # Group into lines
+        lines_dict = {}
+        for word in filtered_words:
+            y_key = round(word['top'] / 2) * 2
             if y_key not in lines_dict:
                 lines_dict[y_key] = []
-            
             lines_dict[y_key].append(word)
         
-        # Sort lines by y position, then sort words in each line by x position
+        # Build text
         sorted_lines = []
         for y_pos in sorted(lines_dict.keys()):
             line_words = sorted(lines_dict[y_pos], key=lambda w: w['x0'])
@@ -1015,59 +1031,45 @@ def extract_text_by_region(pdf_page, bbox: Tuple[float, float, float, float]) ->
         return ""
 
 
-
-def get_content_bbox_adaptive(pdf_page) -> Tuple[float, float, float, float]:
+def get_full_content_bbox(pdf_page) -> Tuple[float, float, float, float]:
     """
-    Adaptive bbox that detects title block based on actual content.
-    
-    Strategy: Find the lowest text cluster - that's likely the title block.
+    More aggressive content detection - don't cut off bottom content.
     """
     w = float(pdf_page.width)
     h = float(pdf_page.height)
     
-    # Get all words to find title block
     words = pdf_page.extract_words()
     
     if not words:
-        # Fallback to conservative fixed bbox
-        return (w * 0.05, h * 0.05, w * 0.95, h * 0.92)
+        return (w * 0.05, h * 0.05, w * 0.95, h * 0.88)
     
-    # Find y-position of bottom 10% of words
-    word_bottoms = [word['bottom'] for word in words]
-    word_bottoms.sort()
+    # Find actual content bounds
+    top_margin = min(word['top'] for word in words) - 10
+    bottom_margin = max(word['bottom'] for word in words) + 10
     
-    # Take the 90th percentile bottom position as the cutoff
-    cutoff_index = int(len(word_bottoms) * 0.9)
-    bottom_cutoff = word_bottoms[cutoff_index] if cutoff_index < len(word_bottoms) else h * 0.92
+    # Don't be too aggressive - keep some safety margins
+    top_margin = max(top_margin, h * 0.03)
+    bottom_margin = min(bottom_margin, h * 0.95)
     
-    # Add small margins
     return (
-        w * 0.03,        # 3% left margin
-        h * 0.03,        # 3% top margin
-        w * 0.97,        # 3% right margin
-        bottom_cutoff    # Adaptive bottom
+        w * 0.03,
+        top_margin,
+        w * 0.97,
+        bottom_margin
     )
-
 
 
 def extract_notes_from_page_improved(pdf_page) -> List[Dict[str, Any]]:
     """
-    Main extraction function with all improvements.
-    
-    Key changes:
-    1. More conservative column detection
-    2. Better text extraction (no layout mode issues)
-    3. Robust note parsing with false positive filtering
-    4. Adaptive title block detection
+    Version 2 extraction with improved column handling.
     """
-    # Get adaptive content bbox
-    bbox = get_content_bbox_adaptive(pdf_page)
+    # Get content bbox
+    bbox = get_full_content_bbox(pdf_page)
     x0, top, x1, bottom = bbox
     
-    # Crop to content area
     content_page = pdf_page.crop(bbox)
     
-    # Extract words for column detection
+    # Extract words
     words = content_page.extract_words(
         x_tolerance=3,
         y_tolerance=3,
@@ -1077,39 +1079,46 @@ def extract_notes_from_page_improved(pdf_page) -> List[Dict[str, Any]]:
     if not words:
         return []
     
-    # Detect columns conservatively
+    # Detect columns with improved algorithm
     content_width = x1 - x0
-    column_bounds = detect_columns_conservative(words, content_width)
+    content_height = bottom - top
+    column_bounds = detect_columns_by_text_flow(words, content_width, content_height)
     
-    print(f"Detected {len(column_bounds)} column(s): {column_bounds}")
+    print(f"Detected {len(column_bounds)} column(s)")
+    for idx, (col_x0, col_x1) in enumerate(column_bounds):
+        print(f"  Column {idx + 1}: {col_x0:.1f} to {col_x1:.1f} (width: {col_x1 - col_x0:.1f})")
     
-    # Extract text from each column
+    # Extract from each column with strict boundaries
     all_notes = []
     
     for col_idx, (col_x0, col_x1) in enumerate(column_bounds):
-        # Adjust column bounds back to full page coordinates
+        # Map back to full page coordinates
         col_bbox = (x0 + col_x0, top, x0 + col_x1, bottom)
         
-        col_text = extract_text_by_region(pdf_page, col_bbox)
+        col_text = extract_text_strict_bbox(pdf_page, col_bbox)
         
         if col_text:
-            print(f"Column {col_idx + 1} extracted {len(col_text)} chars")
+            print(f"Column {col_idx + 1} text length: {len(col_text)}")
             col_notes = parse_numbered_notes_robust(col_text)
-            print(f"Column {col_idx + 1} found {len(col_notes)} notes")
+            print(f"Column {col_idx + 1} notes found: {len(col_notes)}")
+            
+            for note in col_notes:
+                note['column'] = col_idx + 1
+            
             all_notes.extend(col_notes)
     
-    # Deduplicate by (note_id, text_prefix) to handle overlap between columns
+    # Deduplicate
     seen = set()
     unique_notes = []
     
     for note in all_notes:
-        # Use first 50 chars for dedup key (in case of minor OCR differences)
-        key = (note['note_id'], note['text'][:50])
+        # Use first 100 chars for dedup (more generous than before)
+        key = (note['note_id'], note['text'][:100])
         if key not in seen:
             seen.add(key)
             unique_notes.append(note)
     
-    # Sort by note_id numerically
+    # Sort numerically
     unique_notes.sort(key=lambda n: int(n['note_id']))
     
     return unique_notes
