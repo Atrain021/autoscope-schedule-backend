@@ -6,7 +6,7 @@ import gc
 import json
 import uuid
 import base64
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 from pydantic import BaseModel, Field
 
@@ -804,44 +804,67 @@ def _is_notes_page(p: Dict[str, Any]) -> bool:
 
     return False
 
-def _parse_numbered_notes(text: str) -> List[Dict[str, Any]]:
+def parse_numbered_notes_improved(text: str) -> List[Dict[str, Any]]:
     """
-    Parse notes like:
-      1. text...
-      2) text...
-      3: text...
-    Joins wrapped lines into the note.
-    No nonlocal usage (safer).
+    Improved numbered notes parser with better continuation line handling.
+    
+    Handles:
+    - Numbers with period, colon, or parenthesis: "1.", "2)", "3:"
+    - Multi-line notes (indented continuations)
+    - Notes that wrap across multiple lines
     """
-    lines = [ln.rstrip() for ln in (text or "").splitlines()]
-    notes: List[Dict[str, Any]] = []
-
-    current_key: Optional[str] = None
-    current_parts: List[str] = []
-
-    key_re = re.compile(r"^\s*(\d{1,4})\s*[\)\.\:]\s+(.*)$")
-
-    for ln in lines:
-        m = key_re.match(ln)
-        if m:
-            if current_key and current_parts:
+    if not text:
+        return []
+    
+    lines = text.split('\n')
+    notes = []
+    
+    # Regex for note starts: "1." or "2)" or "3:" at line start
+    note_start_pattern = re.compile(r'^\s*(\d{1,4})\s*[\.\)\:]\s+(.*)')
+    
+    current_note_id = None
+    current_text_parts = []
+    
+    for line in lines:
+        line = line.rstrip()
+        
+        # Check if this line starts a new note
+        match = note_start_pattern.match(line)
+        
+        if match:
+            # Save previous note if exists
+            if current_note_id and current_text_parts:
+                combined_text = ' '.join(current_text_parts)
+                # Clean up whitespace
+                combined_text = ' '.join(combined_text.split())
+                
                 notes.append({
-                    "note_id": current_key,
-                    "text": " ".join(" ".join(current_parts).split())
+                    'note_id': current_note_id,
+                    'text': combined_text
                 })
-            current_key = m.group(1)
-            current_parts = [m.group(2)]
-        else:
-            if current_key and ln.strip():
-                current_parts.append(ln.strip())
-
-    if current_key and current_parts:
+            
+            # Start new note
+            current_note_id = match.group(1)
+            current_text_parts = [match.group(2)]
+            
+        elif current_note_id:
+            # This is a continuation line
+            stripped = line.strip()
+            if stripped:
+                current_text_parts.append(stripped)
+    
+    # Don't forget the last note
+    if current_note_id and current_text_parts:
+        combined_text = ' '.join(current_text_parts)
+        combined_text = ' '.join(combined_text.split())
+        
         notes.append({
-            "note_id": current_key,
-            "text": " ".join(" ".join(current_parts).split())
+            'note_id': current_note_id,
+            'text': combined_text
         })
-
+    
     return notes
+
 
 def _dedupe_notes(notes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
@@ -864,512 +887,193 @@ def _dedupe_notes(notes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 import statistics
 from typing import List, Dict, Any, Tuple
 
-def detect_columns_by_density(words: List[Dict[str, Any]], page_width: float, 
-                               bin_width: float = 10.0) -> List[Tuple[float, float]]:
+def detect_columns_improved(words: List[Dict], page_width: float, 
+                           min_gutter_width: float = 30.0) -> List[Tuple[float, float]]:
     """
-    Detect column boundaries using horizontal density analysis.
+    Improved column detection using explicit gutter finding.
     
     Strategy:
-    1. Create histogram of word density across page width
-    2. Find valleys (low-density regions) = gutters between columns
-    3. Return column boundaries as (x_start, x_end) tuples
-    
-    Returns: List of (x_min, x_max) tuples for each column, sorted left-to-right
+    1. Find vertical strips with NO words (gutters)
+    2. Use those to define column boundaries
+    3. Require minimum gutter width to avoid false positives
     """
     if not words:
         return [(0, page_width)]
     
-    # Build density histogram
-    num_bins = int(page_width / bin_width) + 1
-    density = [0] * num_bins
+    # Create list of all horizontal word spans
+    word_spans = [(w['x0'], w['x1']) for w in words]
+    word_spans.sort()
     
-    for word in words:
-        # Count word presence in bins it overlaps
-        x_start = word["x0"]
-        x_end = word["x1"]
+    # Find gaps between words (potential gutters)
+    gutters = []
+    for i in range(len(word_spans) - 1):
+        gap_start = word_spans[i][1]
+        gap_end = word_spans[i + 1][0]
+        gap_width = gap_end - gap_start
         
-        bin_start = int(x_start / bin_width)
-        bin_end = int(x_end / bin_width)
+        # Only consider significant gaps
+        if gap_width >= min_gutter_width:
+            gutters.append((gap_start, gap_end))
+    
+    # Merge overlapping/adjacent gutters
+    if gutters:
+        merged = [gutters[0]]
+        for start, end in gutters[1:]:
+            last_start, last_end = merged[-1]
+            if start <= last_end + 10:  # Allow small overlap
+                merged[-1] = (last_start, max(end, last_end))
+            else:
+                merged.append((start, end))
+        gutters = merged
+    
+    # Find gutter closest to page center (most likely column divider)
+    if gutters:
+        center = page_width / 2
+        gutters_with_distance = [(abs((g[0] + g[1])/2 - center), g) for g in gutters]
+        gutters_with_distance.sort()
         
-        for b in range(max(0, bin_start), min(num_bins, bin_end + 1)):
-            density[b] += 1
-    
-    # Find valleys (potential gutters)
-    # A valley is a region with significantly lower density than neighbors
-    threshold = statistics.mean(density) * 0.2  # valleys should be <20% of average
-    
-    valleys = []
-    in_valley = False
-    valley_start = 0
-    
-    for i, d in enumerate(density):
-        if d < threshold and not in_valley:
-            valley_start = i
-            in_valley = True
-        elif d >= threshold and in_valley:
-            valley_end = i
-            valleys.append((valley_start * bin_width, valley_end * bin_width))
-            in_valley = False
-    
-    # Convert valleys to column boundaries
-    if not valleys:
-        # No gutters found = single column
-        return [(0, page_width)]
-    
-    columns = []
-    current_x = 0
-    
-    for valley_start, valley_end in valleys:
-        # Column ends where gutter begins
-        if valley_start - current_x > 50:  # minimum column width
-            columns.append((current_x, valley_start))
-        current_x = valley_end
-    
-    # Last column (after final gutter)
-    if page_width - current_x > 50:
-        columns.append((current_x, page_width))
-    
-    return columns if columns else [(0, page_width)]
-
-
-def assign_words_to_columns(words: List[Dict[str, Any]], 
-                            column_bounds: List[Tuple[float, float]]) -> List[List[Dict[str, Any]]]:
-    """
-    Assign each word to exactly one column based on its x-center position.
-    
-    Returns: List of word lists, one per column
-    """
-    columns = [[] for _ in column_bounds]
-    
-    for word in words:
-        x_center = (word["x0"] + word["x1"]) / 2.0
+        # Use the gutter closest to center
+        _, best_gutter = gutters_with_distance[0]
+        gutter_mid = (best_gutter[0] + best_gutter[1]) / 2
         
-        # Find which column this word belongs to
-        for i, (x_min, x_max) in enumerate(column_bounds):
-            if x_min <= x_center <= x_max:
-                columns[i].append(word)
-                break
+        return [
+            (0, best_gutter[0]),           # Left column
+            (best_gutter[1], page_width)   # Right column
+        ]
     
-    return columns
+    # No clear gutter = single column
+    return [(0, page_width)]
 
 
-def words_to_lines_strict(words: List[Dict[str, Any]], y_tolerance: float = 3.0) -> List[str]:
+def extract_text_by_column(pdf_page, column_bbox: Tuple[float, float, float, float]) -> str:
     """
-    Convert words to lines using STRICT y-position grouping.
+    Extract text from a specific column using pdfplumber's layout mode.
     
-    Key: Only group words with nearly identical y-positions (same line).
+    Uses layout mode to preserve vertical positioning and line breaks.
     """
-    if not words:
-        return []
+    x0, top, x1, bottom = column_bbox
     
-    # Sort by y-position first (top to bottom), then x-position (left to right)
-    sorted_words = sorted(words, key=lambda w: (round(w["top"], 1), w["x0"]))
-    
-    lines = []
-    current_line_words = []
-    current_y = None
-    
-    for word in sorted_words:
-        word_y = round(word["top"], 1)
+    try:
+        cropped = pdf_page.crop((x0, top, x1, bottom))
         
-        if current_y is None:
-            current_y = word_y
-            current_line_words = [word["text"]]
-        elif abs(word_y - current_y) <= y_tolerance:
-            # Same line
-            current_line_words.append(word["text"])
-        else:
-            # New line
-            if current_line_words:
-                lines.append(" ".join(current_line_words))
-            current_line_words = [word["text"]]
-            current_y = word_y
-    
-    # Don't forget last line
-    if current_line_words:
-        lines.append(" ".join(current_line_words))
-    
-    return lines
-
-
-def extract_text_multicolumn(pdf_page) -> str:
-    """
-    Extract text from PDF page respecting column layout.
-    
-    Algorithm:
-    1. Extract all words with coordinates
-    2. Detect column boundaries using density analysis
-    3. Assign words to columns by x-center
-    4. Within each column, build lines top-to-bottom
-    5. Concatenate columns left-to-right
-    """
-    words = pdf_page.extract_words(
-        x_tolerance=2,
-        y_tolerance=2,
-        keep_blank_chars=False,
-        use_text_flow=False,  # CRITICAL: don't let pdfplumber guess reading order
-    )
-    
-    if not words:
-        return ""
-    
-    page_width = float(pdf_page.width)
-    
-    # Step 1: Detect columns
-    column_bounds = detect_columns_by_density(words, page_width)
-    
-    # Step 2: Assign words to columns
-    column_words = assign_words_to_columns(words, column_bounds)
-    
-    # Step 3: Build text for each column
-    column_texts = []
-    for col_words in column_words:
-        if not col_words:
-            continue
-        lines = words_to_lines_strict(col_words)
-        col_text = "\n".join(lines)
-        if col_text.strip():
-            column_texts.append(col_text)
-    
-    # Step 4: Join columns left-to-right
-    return "\n\n".join(column_texts)
-
-
-# Integration with your existing code:
-def _extract_text_reading_order_auto_columns_FIXED(pdf_page) -> str:
-    """
-    Drop-in replacement for your existing function.
-    """
-    return extract_text_multicolumn(pdf_page)
-
-def _extract_two_column_texts_by_crop(pdf_page) -> List[str]:
-    """
-    Deterministic 2-column reader:
-    - crops the page into left/right halves (with a gutter)
-    - extracts words from each crop
-    - reconstructs lines top->bottom inside each crop
-    Returns [left_text, right_text] (empty strings removed).
-    """
-    w = float(getattr(pdf_page, "width", 0) or 0)
-    h = float(getattr(pdf_page, "height", 0) or 0)
-    if w <= 0 or h <= 0:
-        t = pdf_page.extract_text() or ""
-        return [t] if t else []
-
-    gutter = max(24.0, w * 0.04) # 2% width or 12pt
-    mid = w / 2.0
-
-    # IMPORTANT: do NOT crop top/bottom here.
-    # The caller (extract-notes-v1) already crops the page using bbox.
-    left = pdf_page.crop((0, 0, mid - gutter, h))
-    right = pdf_page.crop((mid + gutter, 0, w, h))
-
-    def words_to_text(p) -> str:
-        words = p.extract_words(
-            x_tolerance=2,
-            y_tolerance=2,
-            keep_blank_chars=False,
-            use_text_flow=False,
+        # Use layout mode which preserves vertical positioning
+        text = cropped.extract_text(
+            layout=True,
+            x_tolerance=3,
+            y_tolerance=3
         )
-        if not words:
-            return ""
-        lines = words_to_lines_strict(words)
-        return "\n".join(lines).strip()
+        
+        if not text:
+            # Fallback to word-based extraction
+            words = cropped.extract_words(
+                x_tolerance=2,
+                y_tolerance=3,
+                keep_blank_chars=False
+            )
+            
+            if words:
+                # Sort by y position then x position
+                words.sort(key=lambda w: (round(w['top'], 0), w['x0']))
+                
+                lines = []
+                current_y = None
+                current_line = []
+                
+                for word in words:
+                    word_y = round(word['top'], 0)
+                    
+                    if current_y is None or abs(word_y - current_y) <= 4:
+                        current_line.append(word['text'])
+                        current_y = word_y
+                    else:
+                        if current_line:
+                            lines.append(' '.join(current_line))
+                        current_line = [word['text']]
+                        current_y = word_y
+                
+                if current_line:
+                    lines.append(' '.join(current_line))
+                
+                text = '\n'.join(lines)
+        
+        return text or ""
+        
+    except Exception as e:
+        print(f"Column extraction error: {e}")
+        return ""
 
-    left_text = words_to_text(left)
-    right_text = words_to_text(right)
-
-    out: List[str] = []
-    if left_text:
-        out.append(left_text)
-    if right_text:
-        out.append(right_text)
-    return out
-
-
-def _looks_like_numbered_notes_page(text: str) -> bool:
-    t = (text or "").upper()
-    if "GENERAL NOTES" in t or "NOTES" in t:
-        return True
-    # If it has multiple numbered note starters, it’s probably a notes list
-    starters = re.findall(r"(?m)^\s*\d{1,3}\s*[\)\.\:]\s+", text or "")
-    return len(starters) >= 5
-
-def _get_notes_content_bbox(pdf_page):
+def get_notes_content_bbox_improved(pdf_page) -> Tuple[float, float, float, float]:
     """
-    Return a bounding box (x0, top, x1, bottom) that excludes
-    common junk areas like title blocks/footers and side keyplans.
-    Coordinates are in PDF points. pdfplumber uses (x0, top, x1, bottom).
+    More conservative bbox that keeps more content.
+    Only removes obvious title block area (bottom 8%) and margins.
     """
     w = float(pdf_page.width)
     h = float(pdf_page.height)
-
-    # Conservative defaults that work on most sheets:
-    # - remove bottom 12% (title block / footer)
-    # - remove right 12% (keyplan/index side strip) ONLY if you want
-    x0 = 0
-    top = 0
-    x1 = w
-    bottom = h * 0.88  # keep top 88%
-
-    # OPTIONAL: if your notes sheets often have a keyplan strip on the far right,
-    # uncomment this:
-    # x1 = w * 0.88
-
+    
+    # Keep 92% of page height (vs your 88%)
+    # Add small margins to avoid edge artifacts
+    x0 = w * 0.05  # 5% left margin
+    top = h * 0.05  # 5% top margin  
+    x1 = w * 0.95  # 5% right margin
+    bottom = h * 0.92  # Keep bottom 8% only for title block
+    
     return (x0, top, x1, bottom)
 
-def _histogram_density(words: List[Dict[str, Any]], axis: str, bins: int, min_v: float, max_v: float) -> List[int]:
+
+def extract_notes_from_page_improved(pdf_page) -> List[Dict[str, Any]]:
     """
-    Build a simple count histogram for word positions along an axis ('x' uses x0/x1 mid, 'y' uses top/bottom mid).
+    Main extraction function combining all improvements.
+    
+    Returns list of note dictionaries with proper handling of multi-column layouts.
     """
-    hist = [0] * bins
+    # Get conservative content bbox
+    bbox = get_notes_content_bbox_improved(pdf_page)
+    x0, top, x1, bottom = bbox
+    
+    # Crop to content area
+    content_page = pdf_page.crop(bbox)
+    
+    # Extract words for column detection
+    words = content_page.extract_words(
+        x_tolerance=2,
+        y_tolerance=3,
+        keep_blank_chars=False
+    )
+    
     if not words:
-        return hist
-
-    span = max(max_v - min_v, 1e-6)
-    for w in words:
-        if axis == "x":
-            v = (float(w["x0"]) + float(w["x1"])) / 2.0
-        else:
-            v = (float(w["top"]) + float(w["bottom"])) / 2.0
-
-        idx = int(((v - min_v) / span) * bins)
-        if idx < 0:
-            idx = 0
-        if idx >= bins:
-            idx = bins - 1
-        hist[idx] += 1
-
-    return hist
-
-
-def _find_best_valley_cut(hist: List[int], cut_range: tuple[float, float] = (0.30, 0.70)) -> Optional[int]:
-    """
-    Choose a cut index in the histogram where density is low (a valley),
-    but only within the central portion (default 30%..70%) to avoid margins.
-    Returns bin index or None.
-    """
-    if not hist or len(hist) < 10:
-        return None
-
-    n = len(hist)
-    lo = int(n * cut_range[0])
-    hi = int(n * cut_range[1])
-    if hi <= lo + 2:
-        return None
-
-    window = hist[lo:hi]
-    if not window:
-        return None
-
-    # Pick the minimum density bin. If many, prefer the one closest to center.
-    min_val = min(window)
-    candidates = [i + lo for i, v in enumerate(window) if v == min_val]
-    if not candidates:
-        return None
-
-    center = n / 2.0
-    candidates.sort(key=lambda i: abs(i - center))
-    return candidates[0]
-
-
-def _split_bbox_vertical(bbox: tuple[float, float, float, float], x_cut: float, gap: float = 6.0):
-    """
-    Split bbox into left/right at x_cut. gap makes a small gutter.
-    """
-    x0, top, x1, bottom = bbox
-    left = (x0, top, max(x0, x_cut - gap), bottom)
-    right = (min(x1, x_cut + gap), top, x1, bottom)
-    return left, right
-
-
-def _split_bbox_horizontal(bbox: tuple[float, float, float, float], y_cut: float, gap: float = 6.0):
-    """
-    Split bbox into top/bottom at y_cut. gap makes a small gutter.
-    """
-    x0, top, x1, bottom = bbox
-    upper = (x0, top, x1, max(top, y_cut - gap))
-    lower = (x0, min(bottom, y_cut + gap), x1, bottom)
-    return upper, lower
-
-
-def _notes_region_score(text: str) -> float:
-    """
-    Heuristic score: higher means more likely to be a notes block.
-    Boosts numbered-list starts; penalizes sheet-index style lists.
-    """
-    t = (text or "")
-    tu = t.upper()
-
-    # Count numbered note starters at line starts: "1.", "2)", "3:"
-    starters = re.findall(r"(?m)^\s*\d{1,3}\s*[\)\.\:]\s+", t)
-    starter_count = len(starters)
-
-    # Penalize sheet index / drawing list vibe: lots of tokens like A101, E-601, M301
-    sheet_ids = re.findall(r"\b[A-Z]{1,3}\s*[-]?\s*\d{2,4}\b", tu)
-    sheet_id_count = len(sheet_ids)
-
-    score = 0.0
-    score += starter_count * 3.0
-
-    if "GENERAL NOTES" in tu:
-        score += 10.0
-    elif "NOTES" in tu:
-        score += 4.0
-
-    # Penalize if it looks like a sheet index region (lots of sheet ids, few numbered starters)
-    if sheet_id_count >= 12 and starter_count <= 3:
-        score -= 12.0
-    else:
-        score -= min(sheet_id_count, 30) * 0.2
-
-    # If it's extremely short, likely not useful
-    if len(t.strip()) < 120:
-        score -= 3.0
-
-    return score
-
-
-def regionize_page_v1(pdf_page, base_bbox: Optional[tuple[float, float, float, float]] = None,
-                      max_regions: int = 6, min_words_per_region: int = 35) -> List[tuple[float, float, float, float]]:
-    """
-    Regionizer v1:
-    - Start from base_bbox (or full page).
-    - Extract words in that bbox.
-    - Find a strong vertical or horizontal whitespace valley near the center.
-    - Recursively split up to max_regions, ensuring each region has enough words.
-
-    Returns list of bboxes in ORIGINAL page coordinates.
-    """
-    # Start bbox
-    if base_bbox is None:
-        base_bbox = (0.0, 0.0, float(pdf_page.width), float(pdf_page.height))
-
-    regions = [base_bbox]
-
-    def word_count_in_bbox(b: tuple[float, float, float, float]) -> int:
-        try:
-            cropped = pdf_page.crop(b)
-            ws = cropped.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=False, use_text_flow=False)
-            return len(ws or [])
-        except Exception:
-            return 0
-
-    # Simple best-first splitting
-    while True:
-        if len(regions) >= max_regions:
-            break
-
-        # Pick region with the most words to attempt splitting
-        regions_with_counts = [(b, word_count_in_bbox(b)) for b in regions]
-        regions_with_counts.sort(key=lambda x: x[1], reverse=True)
-
-        # If biggest region is too small, stop
-        b0, c0 = regions_with_counts[0]
-        if c0 < (min_words_per_region * 2):
-            break
-
-        # Try split this region
-        cropped0 = pdf_page.crop(b0)
-        words = cropped0.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=False, use_text_flow=False) or []
-        if len(words) < (min_words_per_region * 2):
-            break
-
-        # Compute histograms in cropped coordinate space
-        x0, top0, x1, bot0 = b0
-        w_span = max(x1 - x0, 1e-6)
-        h_span = max(bot0 - top0, 1e-6)
-
-        # Use midpoints along axes
-        x_hist = _histogram_density(words, axis="x", bins=80, min_v=x0, max_v=x1)
-        y_hist = _histogram_density(words, axis="y", bins=80, min_v=top0, max_v=bot0)
-
-        x_cut_bin = _find_best_valley_cut(x_hist, (0.30, 0.70))
-        y_cut_bin = _find_best_valley_cut(y_hist, (0.30, 0.70))
-
-        # Turn bin into coordinate
-        x_cut = None
-        y_cut = None
-        if x_cut_bin is not None:
-            x_cut = x0 + (x_cut_bin / 80.0) * w_span
-        if y_cut_bin is not None:
-            y_cut = top0 + (y_cut_bin / 80.0) * h_span
-
-        # Decide which split is "better" by checking word balance
-        best_split = None  # ("v" or "h", bA, bB)
-        best_balance = 0.0
-
-        if x_cut is not None:
-            left, right = _split_bbox_vertical(b0, x_cut, gap=8.0)
-            cL = word_count_in_bbox(left)
-            cR = word_count_in_bbox(right)
-            if min(cL, cR) >= min_words_per_region:
-                balance = min(cL, cR) / max(cL, cR)
-                if balance > best_balance:
-                    best_balance = balance
-                    best_split = ("v", left, right)
-
-        if y_cut is not None:
-            upper, lower = _split_bbox_horizontal(b0, y_cut, gap=8.0)
-            cU = word_count_in_bbox(upper)
-            cD = word_count_in_bbox(lower)
-            if min(cU, cD) >= min_words_per_region:
-                balance = min(cU, cD) / max(cU, cD)
-                if balance > best_balance:
-                    best_balance = balance
-                    best_split = ("h", upper, lower)
-
-        # If no split met minimum criteria, stop splitting
-        if not best_split:
-            break
-
-        # Apply split: replace b0 in regions with the two new bboxes
-        _, bA, bB = best_split
-        new_regions = []
-        for b in regions:
-            if b == b0:
-                new_regions.extend([bA, bB])
-            else:
-                new_regions.append(b)
-        regions = new_regions
-
-    return regions
-
-
-def _extract_best_notes_text_from_page(pdf_page, base_bbox: tuple[float, float, float, float]) -> tuple[str, List[tuple]]:
-    """
-    Uses regionizer + scoring to select best region(s) for notes extraction.
-    Returns (combined_text, chosen_region_bboxes).
-    """
-    region_bboxes = regionize_page_v1(pdf_page, base_bbox=base_bbox, max_regions=6, min_words_per_region=35)
-
-    scored_regions = []
-    for rb in region_bboxes:
-        try:
-            cropped = pdf_page.crop(rb)
-            text = extract_text_multicolumn(cropped) or ""
-            score = _notes_region_score(text)
-            scored_regions.append((score, rb, text))
-        except Exception:
-            continue
-
-    if not scored_regions:
-        return "", []
-
-    scored_regions.sort(key=lambda x: x[0], reverse=True)
-
-    # Keep the best region, and optionally a 2nd if it’s also clearly notes-like
-    best = scored_regions[0]
-    chosen = [best]
-
-    if len(scored_regions) > 1:
-        second = scored_regions[1]
-        # Only include 2nd region if it has real numbered note density too
-        if second[0] >= best[0] * 0.65 and second[0] >= 6.0:
-            chosen.append(second)
-
-    combined = "\n\n".join([c[2] for c in chosen]).strip()
-    return combined, [c[1] for c in chosen]
+        return []
+    
+    # Detect columns
+    content_width = x1 - x0
+    column_bounds = detect_columns_improved(words, content_width)
+    
+    # Extract text from each column
+    all_notes = []
+    
+    for col_x0, col_x1 in column_bounds:
+        # Adjust column bounds back to full page coordinates
+        col_bbox = (x0 + col_x0, top, x0 + col_x1, bottom)
+        
+        col_text = extract_text_by_column(pdf_page, col_bbox)
+        
+        if col_text:
+            col_notes = parse_numbered_notes_improved(col_text)
+            all_notes.extend(col_notes)
+    
+    # Deduplicate by (note_id, text) to handle any overlap
+    seen = set()
+    unique_notes = []
+    
+    for note in all_notes:
+        key = (note['note_id'], note['text'][:100])  # Use first 100 chars for dedup
+        if key not in seen:
+            seen.add(key)
+            unique_notes.append(note)
+    
+    # Sort by note_id numerically
+    unique_notes.sort(key=lambda n: int(n['note_id']))
+    
+    return unique_notes
 
 
 # -----------------------------
@@ -1692,11 +1396,7 @@ async def extract_finish_schedule_by_tags(request: ExtractByTagsRequest):
 @app.post("/extract-notes-v1")
 async def extract_notes_v1(request: ExtractNotesV1Request):
     """
-    Phase 2 Stream B v1:
-    - Select pages by drawing_type (General Notes / Code / Legends / Wall Types)
-    - Extract text with pdfplumber
-    - Parse numbered notes where possible
-    - Fallback to a text snippet if not numbered
+    Phase 2 Stream B v1: Extract numbered notes from general notes pages.
     """
     try:
         filepath = UPLOAD_DIR / request.filename
@@ -1720,106 +1420,25 @@ async def extract_notes_v1(request: ExtractNotesV1Request):
                 "message": "No notes pages found (by drawing_type)."
             })
 
-        note_items: List[Dict[str, Any]] = []
+        note_items = []
 
         with pdfplumber.open(str(filepath)) as pdf:
-            total_pages = len(pdf.pages)
-
-            for pn in page_numbers:
-                idx = pn - 1  # ✅ your system is 1-based page_number
-                if idx < 0 or idx >= total_pages:
+            for page_num in page_numbers:
+                page_idx = page_num - 1  # Convert to 0-based
+                
+                if page_idx < 0 or page_idx >= len(pdf.pages):
                     continue
 
-                page = pdf.pages[idx]
-                bbox = _get_notes_content_bbox(page)
-
-                # 1) ✅ Regionize + pick best notes-like region(s)
-                text, chosen_regions = _extract_best_notes_text_from_page(page, base_bbox=bbox)
-
-                # 2) Fallback: try the bbox only (still avoids title block)
-                if not text.strip():
-                    cropped = page.crop(bbox)
-                    text = _extract_text_reading_order_auto_columns(cropped) or ""
-
-                # 3) Fallback: try full-page reading order
-                if not text.strip():
-                    text = extract_text_multicolumn(page) or ""
-
-                # 4) Last resort: raw pdfplumber text
-                if not text.strip():
-                    # For notes sheets: use column-aware reading order to avoid left/right interleaving
-                    text = _extract_text_reading_order_auto_columns(page) or (page.extract_text() or "")
-
-
-                # ✅ NEW: parse per column (prevents left/right interleaving)
-                page_notes: List[Dict[str, Any]] = []
-
-                # Prefer column extraction from the chosen regions if we have them,
-                # otherwise use the bbox-cropped page.
-                # Always parse from ONE stable crop: the bbox.
-                # (This prevents double-parsing and region overlap duplicates.)
-                cropped_bbox = page.crop(bbox)
-
-                # 1) Try your general N-column method first (works for 1,2,3,4,5 columns)
-                words = cropped_bbox.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=False, use_text_flow=False)
-                page_width = float(cropped_bbox.width)
-                column_bounds = detect_columns_by_density(words, page_width)
-                column_words = assign_words_to_columns(words, column_bounds)
-                col_texts = []
-                for col_words in column_words:
-                    if col_words:
-                        lines = words_to_lines_strict(col_words)
-                        col_text = "\n".join(lines)
-                        if col_text.strip():
-                            col_texts.append(col_text)
-
-                # 2) If it looks like a 2-column page, compare against the hard 2-column crop method
-                if len(col_texts) == 2:
-                    def starters_count(t: str) -> int:
-                        return len(re.findall(r"(?m)^\s*\d{1,4}\s*[\)\.\:]\s+", t or ""))
-
-                    clustered_score = starters_count(col_texts[0]) + starters_count(col_texts[1])
-
-                    cropped_2col = _extract_two_column_texts_by_crop(cropped_bbox)
-                    crop_score = sum(starters_count(t) for t in cropped_2col)
-
-                    # pick whichever gives more numbered-note starters
-                    if crop_score > clustered_score:
-                        col_texts = cropped_2col
-
-                # 3) Fallback: if nothing came back, use reading-order text
-                if not col_texts:
-                    fallback_text = extract_text_multicolumn(cropped_bbox) or (cropped_bbox.extract_text() or "")
-                    col_texts = [fallback_text] if fallback_text else []
-
-                # 4) Parse notes per column
-                for col_text in col_texts:
-                    page_notes.extend(_parse_numbered_notes(col_text))
-
-                # 5) Deduplicate (fixes your “same notes twice” problem)
-                page_notes = _dedupe_notes(page_notes)
-
-
-
-
-                if page_notes:
-                    for n in page_notes:
-                        note_items.append({
-                            "source_page_number": pn,
-                            "note_id": n["note_id"],
-                            "text": n["text"],
-                            "parse_method": "numbered_notes_two_column_crop"
-                        })
-                else:
-                    # fallback snippet (only if it really looks notes-like)
-                    cleaned = " ".join(text.strip().split())
-                    if cleaned and _looks_like_numbered_notes_page(cleaned) and _notes_region_score(text) >= 6.0:
-                        note_items.append({
-                            "source_page_number": pn,
-                            "note_id": None,
-                            "text": cleaned[:2000],
-                            "parse_method": "fulltext_snippet_column_aware"
-                        })
+                page = pdf.pages[page_idx]
+                notes = extract_notes_from_page_improved(page)
+                
+                for note in notes:
+                    note_items.append({
+                        'source_page_number': page_num,
+                        'note_id': note['note_id'],
+                        'text': note['text'],
+                        'parse_method': 'improved_multicolumn_extraction'
+                    })
 
         return JSONResponse({
             "ok": True,
@@ -1836,7 +1455,6 @@ async def extract_notes_v1(request: ExtractNotesV1Request):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"extract-notes-v1 failed: {str(e)}")
-
 
 class ClassifyPdfRequest(BaseModel):
     filename: str
