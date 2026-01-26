@@ -804,14 +804,9 @@ def _is_notes_page(p: Dict[str, Any]) -> bool:
 
     return False
 
-def parse_numbered_notes_robust(text: str) -> List[Dict[str, Any]]:
+def parse_numbered_notes_improved(text: str) -> List[Dict[str, Any]]:
     """
-    More robust numbered notes parser that handles edge cases.
-    
-    Improvements:
-    - Relaxed regex (no required space after delimiter)
-    - Better handling of wrapped lines
-    - Filters out false positives (dates, measurements, etc.)
+    Enhanced note parser with better handling of multi-line notes.
     """
     if not text:
         return []
@@ -819,8 +814,7 @@ def parse_numbered_notes_robust(text: str) -> List[Dict[str, Any]]:
     lines = text.split('\n')
     notes = []
     
-    # More flexible pattern - delimiter can be ., ), or :
-    # No required space after delimiter
+    # More flexible pattern
     note_start_pattern = re.compile(r'^\s*(\d{1,3})\s*[\.\)\:]\s*(.*)', re.IGNORECASE)
     
     current_note_id = None
@@ -829,36 +823,26 @@ def parse_numbered_notes_robust(text: str) -> List[Dict[str, Any]]:
     for line in lines:
         line = line.rstrip()
         
-        # Skip obviously non-note lines
         if not line.strip():
             continue
         
-        # Check if this line starts a new note
         match = note_start_pattern.match(line)
         
         if match:
             note_num = match.group(1)
             note_text = match.group(2).strip()
             
-            # Filter false positives:
-            # - Skip if "note" is actually a measurement like "1. 5 inches"
-            # - Skip if "note" is actually a date or time
-            # - Skip if number is too high (> 200) - unlikely to be a note number
+            # Validation filters
             if int(note_num) > 200:
                 continue
             
-            if note_text and (
-                re.match(r'^\d+\s*(inch|in|ft|feet|mm|cm|meter)', note_text, re.IGNORECASE) or
-                re.match(r'^\d+[:/]\d+', note_text)  # Date or time pattern
-            ):
-                continue
-            
-            # Save previous note if exists
+            # Save previous note
             if current_note_id is not None and current_text_parts:
                 combined_text = ' '.join(current_text_parts)
-                combined_text = ' '.join(combined_text.split())  # Normalize whitespace
+                combined_text = ' '.join(combined_text.split())
                 
-                if len(combined_text) > 15:  # Filter very short "notes" (likely false positives)
+                # REDUCED minimum length - was causing note 17 to be skipped
+                if len(combined_text) > 10:  # Changed back from 15
                     notes.append({
                         'note_id': current_note_id,
                         'text': combined_text
@@ -869,22 +853,29 @@ def parse_numbered_notes_robust(text: str) -> List[Dict[str, Any]]:
             current_text_parts = [note_text] if note_text else []
             
         elif current_note_id is not None:
-            # Continuation line
             stripped = line.strip()
             
-            # Skip lines that look like they're from a different section
-            if re.match(r'^[A-Z\s]{20,}$', stripped):  # All caps header
+            # Skip likely headers/noise
+            if re.match(r'^[A-Z\s]{20,}$', stripped):
+                continue
+            
+            # Skip page numbers and sheet references
+            if re.match(r'^(PAGE|SHEET|OF)\s*\d+', stripped, re.IGNORECASE):
+                continue
+            
+            # CRITICAL: Skip reference codes (A380, A400, etc.) that appear mid-column
+            if re.match(r'^[A-Z]\d{3}', stripped):
                 continue
             
             if stripped:
                 current_text_parts.append(stripped)
     
-    # Don't forget the last note
+    # Last note
     if current_note_id is not None and current_text_parts:
         combined_text = ' '.join(current_text_parts)
         combined_text = ' '.join(combined_text.split())
         
-        if len(combined_text) > 15:
+        if len(combined_text) > 10:  # Changed back from 15
             notes.append({
                 'note_id': current_note_id,
                 'text': combined_text
@@ -969,8 +960,8 @@ def detect_columns_by_text_flow(words: List[Dict], page_width: float, page_heigh
     right_min = min(w['x0'] for w in right_words)
     
     return [
-        (0, left_max + 5),  # Small padding
-        (right_min - 5, page_width)
+        (0, split_point - 10),  # Stop well before the split
+        (split_point + 10, page_width)  # Start well after the split
     ]
 
 
@@ -1099,7 +1090,7 @@ def extract_notes_from_page_improved(pdf_page) -> List[Dict[str, Any]]:
         
         if col_text:
             print(f"Column {col_idx + 1} text length: {len(col_text)}")
-            col_notes = parse_numbered_notes_robust(col_text)
+            col_notes = parse_numbered_notes_improved(col_text)
             print(f"Column {col_idx + 1} notes found: {len(col_notes)}")
             
             for note in col_notes:
